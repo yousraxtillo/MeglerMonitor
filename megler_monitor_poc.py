@@ -4,7 +4,7 @@ from typing import Iterable, Optional, Tuple
 import requests, pandas as pd
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import datetime as dt  # NY
+import datetime as dt  
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -16,8 +16,9 @@ def snapshot_ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-# ---------- Utils ----------
+#Utils
 OUT_DIR = "out"; os.makedirs(OUT_DIR, exist_ok=True)
+RAW_DIR = os.path.join(OUT_DIR, "raw"); os.makedirs(RAW_DIR, exist_ok=True)
 UA = "MeglerMonitor/POC (+contact: yousra)"
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 def jitter(a=0.3,b=0.9): time.sleep(random.uniform(a,b))
@@ -25,9 +26,78 @@ def save_csv(df, name):
     p = os.path.join(OUT_DIR,name); df.to_csv(p, index=False)
     print(f"[ok] {name} ({len(df)} rader) lagret.")
 
+def save_snapshot(df, name):
+    date_part = dt.datetime.now().strftime("%Y-%m-%d")
+    base = name.replace(".csv", "")
+    primary = os.path.join(RAW_DIR, f"{date_part}_{base}.csv")
+    if os.path.exists(primary):
+        time_part = dt.datetime.now().strftime("%H%M%S")
+        target = os.path.join(RAW_DIR, f"{date_part}_{time_part}_{base}.csv")
+    else:
+        target = primary
+    df.to_csv(target, index=False)
+    print(f"[snapshot] {os.path.relpath(target, start=OUT_DIR)} ({len(df)} rader)")
+
 def to_int(x):
     try: return int(float(str(x).replace("\u00a0","").replace(" ","").replace(",",".")))
     except: return None
+
+
+
+HJEM_TYPE_MAP = {
+    "single_dwelling": "Enebolig",
+    "apartment": "Leilighet",
+    "twin_dwelling": "Tomannsbolig",
+    "townhouse": "Rekkehus",
+    "plot": "Tomt",
+    "farm": "Gårdsbruk",
+    "others": "Annet",
+}
+
+DNB_PROPERTY_TYPE_MAP = {
+    24: "Leilighet",
+    1: "Enebolig",
+    2: "Tomannsbolig",
+    3: "Rekkehus",
+    7: "Fritidsbolig",
+    8: "Tomt",
+    12: "Garasje/Parkering",
+    17: "Landbrukseiendom",
+}
+
+
+#kartlegger hjem type
+def map_hjem_type(values):
+    if not values:
+        return "Annet"
+    for raw in values:
+        mapped = HJEM_TYPE_MAP.get(str(raw).lower())
+        if mapped:
+            return mapped
+    return "Annet"
+
+
+#kartlegger dnb type
+def map_dnb_type(value):
+    try:
+        key = int(value)
+    except (TypeError, ValueError):
+        return "Annet"
+    return DNB_PROPERTY_TYPE_MAP.get(key, "Annet")
+
+
+#klassifiserer rolle
+def classify_role(text: str | None) -> str:
+    if not text:
+        return "(ukjent rolle)"
+    lowered = str(text).lower()
+    if "fullmektig" in lowered or "trainee" in lowered:
+        return "Fullmektig"
+    if "megler" in lowered:
+        return "Megler"
+    if "oppgjør" in lowered:
+        return "Oppgjør"
+    return "Annet"
 
 
 def _normalize_case(value: Optional[str]) -> Optional[str]:
@@ -160,12 +230,12 @@ def _extract_dnb_published(doc: dict, fallback: str) -> str:
 
     return primary or fallback
 
-# robust session
+#robust session
 session = requests.Session()
 adapter = HTTPAdapter(max_retries=Retry(total=3, backoff_factor=0.6, status_forcelist=[429,500,502,503,504]))
 session.mount("https://", adapter); session.mount("http://", adapter)
 
-# ---------- HJEM.NO ----------
+#HJEM.NO
 HJEM_URL = "https://apigw.hjem.no/search-backend/api/v4/property/search"
 HJEM_HEADERS = {"User-Agent":UA,"Accept":"application/json","Content-Type":"application/json","Referer":"https://hjem.no/"}
 HJEM_BASE_PAYLOAD = {"listing_type":"residential_sale","order":"desc","page":1,"size":50,"view":"list"}
@@ -180,26 +250,36 @@ def fetch_hjem_page(p):
         logging.error(f"Failed to fetch Hjem.no page {p.get('page')}: {e}")
         return {"data": []}
 
+#parser hjem ad
 def parse_hjem_ad(ad):
     agency = ad.get("agency") or {}
     address = ad.get("address") or {}
     price = (ad.get("prices") or {}).get("asking_price",{}).get("amount")
-    agents = [c.get("name") for c in ad.get("contacts",[]) if c.get("type")=="agent" and c.get("name")] or [None]
-    rows=[]
+    contacts = [c for c in ad.get("contacts", []) if c.get("type") == "agent" and c.get("name")]
+    property_type = map_hjem_type(ad.get("type"))
+    rows = []
     snap = snapshot_ts()
-    for agent in agents:
-        rows.append({
+    if not contacts:
+        contacts = [None]
+    for contact in contacts:
+        name = contact.get("name") if contact else None
+        position = contact.get("position") if contact else None
+        role = classify_role(position)
+        #appender til radliste
+    rows.append({
             "source":"Hjem.no",
             "listing_id": ad.get("id"),
             "title": ad.get("title"),
             "address": address.get("display_name"),
             "city": address.get("postal_place"),
             "chain": agency.get("name"),
-            "broker": agent,
+            "broker": name,
             "price": to_int(price),
             "status": ad.get("status"),
             "published": ad.get("publish_date"),
-            "snapshot_at": snap,          # 👈 nytt felt
+            "property_type": property_type,
+            "broker_role": role,
+            "snapshot_at": snap,          #nytt felt
             "last_seen_at": now_iso()
         })
     return rows
@@ -233,10 +313,10 @@ def collect_hjem():
     return pd.DataFrame(rows)
 
 
-# ---------- DNB EIENDOM ----------
+#DNB
 DNB_URL = "https://dnbeiendom.no/api/v1/cognitivesearch/properties"
 DNB_HEADERS = {"User-Agent":UA,"Accept":"application/json","Content-Type":"application/json","Referer":"https://dnbeiendom.no/"}
-# Fra DevTools (du fant payloaden): legg til "brokers" i select for å få meglernavn
+#Fra DevTools (du fant payloaden): legg til "brokers" i select for å få meglernavn
 DNB_BASE_PAYLOAD = {
     "facets": [],
     "filter": "(status eq 2 and projectRelation eq 3 or (projectRelation eq 1 and status ne 99)) and status ne 3 and status ne null and not (projectRelation eq 1 and status eq 99) and not (projectRelation eq 2 and status eq 99)",
@@ -256,16 +336,28 @@ def fetch_dnb_page(skip, top):
     print(f"[DNB] skip={skip} top={top} status={r.status_code}")
     r.raise_for_status(); return r.json()
 
+#parser dnb ad
 def parse_dnb_ad(doc):
     price_obj = doc.get("price") or {}
     price = price_obj.get("salePrice") or price_obj.get("askingPrice") or price_obj.get("totalPrice")
     loc_values, city = _extract_dnb_location_fields(doc.get("locations"))
     address = ", ".join(loc_values) if loc_values else None
-    brokers = [b.get("name") for b in (doc.get("brokers") or []) if b.get("name")] or [None]
-    rows=[]
+    brokers_dict = {}
+    for broker in doc.get("brokers") or []:
+        name = broker.get("name")
+        if not name:
+            continue
+        title = broker.get("title") or broker.get("role")
+        if name not in brokers_dict:
+            brokers_dict[name] = title
+    rows = []
     snap = snapshot_ts()
     published = _extract_dnb_published(doc, snap)
-    for br in brokers:
+    property_type = map_dnb_type(doc.get("propertyTypeId"))
+    if not brokers_dict:
+        brokers_dict = {None: None}
+    for name, title in brokers_dict.items():
+        role = classify_role(title)
         rows.append({
             "source":"DNB",
             "listing_id": doc.get("id"),
@@ -273,14 +365,17 @@ def parse_dnb_ad(doc):
             "address": address,
             "city": city,
             "chain": "DNB Eiendom",
-            "broker": br,
+            "broker": name,
             "price": to_int(price),
             "status": _map_dnb_status(doc.get("status")),
             "published": published,
+            "property_type": property_type,
+            "broker_role": role,
             "snapshot_at": snap,          # 👈 nytt felt
             "last_seen_at": now_iso()
         })
     return rows
+
 
 def collect_dnb():
     rows = []
@@ -309,25 +404,47 @@ def collect_dnb():
     return pd.DataFrame(rows)
 
 # ---------- Aggregation ----------
+COMMISSION_RATE = 0.0125
+
+#summerer per megler
 def sum_per_broker(df):
-    if df.empty: return df
+    if df.empty:
+        return df
     df = df.copy()
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
     df = df.dropna(subset=["price"])
-    return (df.groupby(["source","chain","broker"], dropna=False)["price"]
-              .sum().reset_index().rename(columns={"price":"sum_price"})
-              .sort_values("sum_price", ascending=False))
+
+    grouped = (
+        df.groupby(["source", "chain", "broker"], dropna=False)
+          .agg(sum_price=("price", "sum"), listing_count=("listing_id", "count"))
+          .reset_index()
+    )
+    grouped["commission_base"] = grouped["sum_price"] * COMMISSION_RATE
+    grouped["commission_avg"] = (
+        grouped["commission_base"]
+        .div(grouped["listing_count"].replace({0: pd.NA}))
+        .fillna(0.0)
+    )
+    return grouped.sort_values("commission_base", ascending=False)
 
 # ---------- Main ----------
 if __name__ == "__main__":
     print("[RUN] MeglerMonitor POC – Hjem.no + DNB")
 
-    hjem_df = collect_hjem();      save_csv(hjem_df, "hjem_listings.csv")
-    dnb_df  = collect_dnb();       save_csv(dnb_df,  "dnb_listings.csv")
+    hjem_df = collect_hjem()
+    save_csv(hjem_df, "hjem_listings.csv")
+    save_snapshot(hjem_df, "hjem_listings.csv")
+
+    dnb_df = collect_dnb()
+    save_csv(dnb_df, "dnb_listings.csv")
+    save_snapshot(dnb_df, "dnb_listings.csv")
 
     both = pd.concat([hjem_df, dnb_df], ignore_index=True)
     save_csv(both, "all_listings.csv")
+    save_snapshot(both, "all_listings.csv")
 
-    agg = sum_per_broker(both);    save_csv(agg, "agg_sum_per_broker.csv")
+    agg = sum_per_broker(both)
+    save_csv(agg, "agg_sum_per_broker.csv")
+    save_snapshot(agg, "agg_sum_per_broker.csv")
 
     print("[DONE]")

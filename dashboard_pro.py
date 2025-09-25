@@ -1,4 +1,3 @@
-# dashboard_pro.py
 from pathlib import Path
 import math
 from typing import Tuple
@@ -6,15 +5,41 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 
-# -------------------- App setup --------------------
+#App setup
 st.set_page_config(page_title="MeglerMonitor", layout="wide")
 OUT = (Path(__file__).resolve().parent / "out").expanduser()
 OUT.mkdir(parents=True, exist_ok=True)
 
-# -------------------- Helpers --------------------
+#Helpers
 @st.cache_data
 def load_csv(p: Path) -> pd.DataFrame:
     return pd.read_csv(p) if p.exists() else pd.DataFrame()
+
+@st.cache_data
+def load_snapshot_csv(filename: str, which: str = "earliest") -> tuple[pd.DataFrame | None, str | None]:
+    raw_dir = OUT / "raw"
+    if not raw_dir.exists():
+        return None, None
+
+    candidates = sorted(raw_dir.glob(f"*_{filename}"))
+    if not candidates:
+        return None, None
+
+    if which == "earliest":
+        target = candidates[0]
+    elif which == "latest":
+        target = candidates[-1]
+    else:
+        raise ValueError("which must be 'earliest' or 'latest'")
+
+    try:
+        df = pd.read_csv(target)
+    except Exception:
+        return None, None
+
+    stamp = target.name[:-len(filename)].rstrip("_")
+    return df, stamp
+
 
 def fmt_nok(x: float | int | None) -> str:
     if x is None or (isinstance(x, float) and (pd.isna(x) or math.isnan(float(x)))):
@@ -57,6 +82,14 @@ STATUS_LABELS = {
     99: "archived",
 }
 
+
+COMMISSION_RATE = 0.0125
+COMMISSION_LABEL = f"{COMMISSION_RATE * 100:.2f}%"
+
+MIN_LISTINGS_FOR_AVG = 5
+
+PRICE_BANDS = [0, 5_000_000, 10_000_000, 15_000_000, 20_000_000, float('inf')]
+PRICE_BAND_LABELS = ["0–5 mill", "5–10 mill", "10–15 mill", "15–20 mill", "20+ mill"]
 
 def normalize_case(value: str | float | None) -> str | None:
     if value is None or pd.isna(value):
@@ -152,8 +185,151 @@ def kpi_card(label: str, value: str, sublabel: str = "–", positive=True):
         unsafe_allow_html=True,
     )
 
+#konverterer dato
 def to_dt_safe(s: pd.Series) -> pd.Series:
-    return pd.to_datetime(s, errors="coerce", utc=True)
+    if s is None:
+        return pd.Series(dtype='datetime64[ns, UTC]')
+    cleaned = s.astype(str).str.strip()
+    cleaned = cleaned.replace({'': pd.NA, 'nan': pd.NA, 'None': pd.NA, 'NaT': pd.NA})
+    return pd.to_datetime(cleaned, errors='coerce', utc=True, format='ISO8601')
+
+#klargjør df
+def prepare_dataframe(df: pd.DataFrame | None) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame()
+    out = df.copy()
+    if out.empty:
+        return out
+
+
+    if "price" in out.columns:
+        out["price"] = pd.to_numeric(out["price"], errors="coerce")
+    if "property_type" in out.columns:
+        out["property_type"] = out["property_type"].fillna("(ukjent boligtype)")
+    else:
+        out["property_type"] = "(ukjent boligtype)"
+    if "broker_role" in out.columns:
+        out["broker_role"] = out["broker_role"].fillna("(ukjent rolle)")
+    else:
+        out["broker_role"] = "(ukjent rolle)"
+
+    if "price" in out.columns:
+        price_band = pd.cut(out["price"], bins=PRICE_BANDS, labels=PRICE_BAND_LABELS, include_lowest=True, right=False)
+        price_band = price_band.cat.add_categories(["(ukjent prissjikt)"]).fillna("(ukjent prissjikt)")
+        out["price_band"] = price_band
+    else:
+        out["price_band"] = "(ukjent prissjikt)"
+
+
+    if "city" in out.columns:
+        out["city"] = out["city"].apply(normalize_case)
+        if "address" in out.columns:
+            missing_city = out["city"].isna() | out["city"].astype(str).str.strip().eq("")
+            out.loc[missing_city, "city"] = out.loc[missing_city, "address"].apply(infer_city_from_address)
+        out["city"] = out["city"].apply(normalize_case)
+
+    if "status" in out.columns:
+        out["status"] = out["status"].apply(normalize_status)
+
+    if "published" in out.columns:
+        out["published"] = out["published"].apply(clean_timestamp)
+        if "snapshot_at" in out.columns:
+            mask = out["published"].isna()
+            out.loc[mask, "published"] = out.loc[mask, "snapshot_at"].apply(clean_timestamp)
+        if "last_seen_at" in out.columns:
+            mask = out["published"].isna()
+            out.loc[mask, "published"] = out.loc[mask, "last_seen_at"].apply(clean_timestamp)
+
+    for col in ["broker", "chain", "city", "source", "title", "status"]:
+        if col in out.columns:
+            out[col] = out[col].fillna(f"(ukjent {col})")
+
+    if "published" in out.columns:
+        out["published_dt"] = to_dt_safe(out["published"])
+    else:
+        out["published_dt"] = pd.NaT
+
+    return out
+
+
+#appliserer filtre
+def apply_filters(df: pd.DataFrame | None,
+                  city: str,
+                  chains: list[str],
+                  chain_keyword: str,
+                  roles: list[str],
+                  sources: list[str],
+                  search: str,
+                  period: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        if isinstance(df, pd.DataFrame):
+            return df.iloc[0:0].copy()
+        return pd.DataFrame()
+
+    subset = df.copy()
+
+    if city != "(Alle)" and "city" in subset.columns:
+        subset = subset[subset["city"] == city]
+
+    if chains and "chain" in subset.columns:
+        subset = subset[subset["chain"].isin(chains)]
+
+    if chain_keyword.strip() and "chain" in subset.columns:
+        kw = chain_keyword.strip().lower()
+        subset = subset[subset["chain"].str.lower().str.contains(kw, na=False)]
+
+    if roles and "broker_role" in subset.columns:
+        subset = subset[subset["broker_role"].isin(roles)]
+
+    if sources and "source" in subset.columns:
+        subset = subset[subset["source"].isin(sources)]
+
+    if search.strip():
+        s = search.strip().lower()
+        mask = False
+        if "broker" in subset.columns:
+            mask = mask | subset["broker"].str.lower().str.contains(s, na=False)
+        if "chain" in subset.columns:
+            mask = mask | subset["chain"].str.lower().str.contains(s, na=False)
+        if "title" in subset.columns:
+            mask = mask | subset["title"].str.lower().str.contains(s, na=False)
+        subset = subset[mask]
+
+    if "published_dt" in subset.columns:
+        now_utc = pd.Timestamp.utcnow()
+        if period == "Siste 30 dager":
+            start = now_utc - pd.Timedelta(days=30)
+            subset = subset[subset["published_dt"] >= start]
+        elif period == "Siste 12 mnd":
+            start = now_utc - pd.Timedelta(days=365)
+            subset = subset[subset["published_dt"] >= start]
+        elif period == "Dette året":
+            start = pd.Timestamp(year=now_utc.tz_convert("Europe/Oslo").year, month=1, day=1, tz="Europe/Oslo").tz_convert("UTC")
+            subset = subset[subset["published_dt"] >= start]
+
+    return subset
+
+
+def compute_change(current: float, baseline: float) -> tuple[float, float]:
+    delta = current - baseline
+    if baseline > 0:
+        pct = (delta / baseline) * 100.0
+    elif current > 0:
+        pct = 100.0
+    else:
+        pct = 0.0
+    return delta, pct
+
+
+#tekst for pct
+def pct_change_label(current: float, previous: float, suffix: str = "vs forrige periode") -> tuple[float | None, str]:
+    if previous > 0:
+        pct = ((current - previous) / previous) * 100.0
+        return pct, f"{pct:+.1f}% {suffix}"
+    if current == 0:
+        return 0.0, f"0.0% {suffix}"
+    return None, "Ingen data forrige periode"
+
 
 def split_windows_12m(df: pd.DataFrame, col="published_dt") -> Tuple[pd.DataFrame, pd.DataFrame]:
     """NOW=last 12 months, PREV=the 12 months before that."""
@@ -172,7 +348,7 @@ def sales_count(df_in: pd.DataFrame) -> int:
         return 0
     return int(len(df_in))
 
-# -------------------- CSS --------------------
+#CSS
 st.markdown("""
 <style>
 body { background: #0d1015; }
@@ -215,49 +391,25 @@ body { background: #0d1015; }
 """, unsafe_allow_html=True)
 
 # -------------------- Load & clean data --------------------
-df = load_csv(OUT / "all_listings.csv")
-if df.empty:
+df_raw = load_csv(OUT / "all_listings.csv")
+if df_raw.empty:
     st.warning("Ingen data i `out/`. Kjør: `python -u megler_monitor_poc.py` først.")
     st.stop()
 
-# Numeric/text cleanup
-if "price" in df.columns:
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+df = prepare_dataframe(df_raw)
 
-if "city" in df.columns:
-    df["city"] = df["city"].apply(normalize_case)
-    if "address" in df.columns:
-        missing_city = df["city"].isna() | df["city"].astype(str).str.strip().eq("")
-        df.loc[missing_city, "city"] = df.loc[missing_city, "address"].apply(infer_city_from_address)
-    df["city"] = df["city"].apply(normalize_case)
-
-if "status" in df.columns:
-    df["status"] = df["status"].apply(normalize_status)
-
-if "published" in df.columns:
-    df["published"] = df["published"].apply(clean_timestamp)
-    if "snapshot_at" in df.columns:
-        mask = df["published"].isna()
-        df.loc[mask, "published"] = df.loc[mask, "snapshot_at"].apply(clean_timestamp)
-    if "last_seen_at" in df.columns:
-        mask = df["published"].isna()
-        df.loc[mask, "published"] = df.loc[mask, "last_seen_at"].apply(clean_timestamp)
-
-for col in ["broker", "chain", "city", "source", "title", "status"]:
-    if col in df.columns:
-        df[col] = df[col].fillna(f"(ukjent {col})")
-
-# Dates
-if "published" in df.columns:
-    df["published_dt"] = to_dt_safe(df["published"])
+baseline_raw, baseline_stamp = load_snapshot_csv("all_listings.csv", which="earliest")
+if baseline_raw is not None and not baseline_raw.empty:
+    baseline_df = prepare_dataframe(baseline_raw)
 else:
-    df["published_dt"] = pd.NaT
+    baseline_df = pd.DataFrame()
+baseline_label = baseline_stamp or "første snapshot"
 
-# -------------------- Header --------------------
+#Header
 st.title("MeglerMonitor")
 snapshot_ts = pd.Timestamp.now(tz="Europe/Oslo").strftime("%Y-%m-%d %H:%M")
 
-# -------------------- Filters --------------------
+#Filters
 with st.expander("Filtre", expanded=True):
     c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.2, 1])
 
@@ -266,6 +418,7 @@ with st.expander("Filtre", expanded=True):
 
     chains = sorted(df["chain"].dropna().unique().tolist())
     sel_chains = c2.multiselect("Kjede/kontor", chains, default=[])
+    chain_keyword = c2.text_input("Kjedesøk (tekst)", "", placeholder="F.eks. Nordvik")
 
     sources = sorted(df["source"].dropna().unique().tolist())
     sel_sources = c3.multiselect("Kilde", sources, default=sources)
@@ -279,80 +432,67 @@ with st.expander("Filtre", expanded=True):
         index=0
     )
 
-flt = df.copy()
-if sel_city != "(Alle)":
-    flt = flt[flt["city"] == sel_city]
-if sel_chains:
-    flt = flt[flt["chain"].isin(sel_chains)]
-if sel_sources:
-    flt = flt[flt["source"].isin(sel_sources)]
-if search.strip():
-    s = search.strip().lower()
-    flt = flt[
-        flt["broker"].str.lower().str.contains(s, na=False) |
-        flt["chain"].str.lower().str.contains(s, na=False) |
-        flt["title"].str.lower().str.contains(s, na=False)
-    ]
+    c6, _ = st.columns([1.2, 3])
+    role_options = sorted(df["broker_role"].dropna().unique().tolist()) if "broker_role" in df.columns else []
+    default_roles = role_options if role_options else []
+    sel_roles = c6.multiselect("Meglerrolle", role_options, default=default_roles) if role_options else []
 
-# Optional time filter for the tables
-if "published_dt" in flt.columns:
-    now_utc = pd.Timestamp.utcnow()
-    if period == "Siste 30 dager":
-        start = now_utc - pd.Timedelta(days=30)
-        flt = flt[flt["published_dt"] >= start]
-    elif period == "Siste 12 mnd":
-        start = now_utc - pd.Timedelta(days=365)
-        flt = flt[flt["published_dt"] >= start]
-    elif period == "Dette året":
-        start = pd.Timestamp(year=now_utc.tz_convert("Europe/Oslo").year, month=1, day=1, tz="Europe/Oslo").tz_convert("UTC")
-        flt = flt[flt["published_dt"] >= start]
+flt = apply_filters(df, sel_city, sel_chains, chain_keyword, sel_roles, sel_sources, search, period)
+baseline_flt = apply_filters(baseline_df, sel_city, sel_chains, chain_keyword, sel_roles, sel_sources, search, period)
+baseline_has_data = not baseline_flt.empty
 
-# -------------------- KPI row (last 12m vs previous 12m) --------------------
-# KPI should always be computed on the CURRENT filter selection but with fixed windows (12m vs prev 12m)
+#KPI row (last 12m vs previous 12m
+#KPI should always be computed on the CURRENT filter selection but with fixed windows (12m vs prev 12m)
 now12, prev12 = split_windows_12m(flt, col="published_dt")
 
-# Aktive annonser (siste 12 mnd)
+#Aktive annonser (siste 12 mnd)
 listings_now = sales_count(now12)
 listings_prev = sales_count(prev12)
 listings_delta_val = listings_now - listings_prev
-listings_delta_pct = ((listings_now - listings_prev) / listings_prev * 100) if listings_prev > 0 else (100.0 if listings_now > 0 else 0.0)
+_, listings_delta_label = pct_change_label(listings_now, listings_prev)
 
-# Total verdi av aktive boliger
+#Total verdi av aktive boliger
 omset_now = float(np.nan_to_num(now12["price"]).sum())
 omset_prev = float(np.nan_to_num(prev12["price"]).sum())
 omset_delta_val = omset_now - omset_prev
-omset_delta_pct = (omset_delta_val / omset_prev * 100) if omset_prev > 0 else (100.0 if omset_now > 0 else 0.0)
+_, omset_delta_label = pct_change_label(omset_now, omset_prev)
 
-# Meglere med aktive annonser
+commission_now = omset_now * COMMISSION_RATE
+commission_prev = omset_prev * COMMISSION_RATE
+commission_delta_val = commission_now - commission_prev
+_, commission_delta_label = pct_change_label(commission_now, commission_prev, suffix=f"vs forrige periode ({COMMISSION_LABEL})")
+
 active_now = int(now12["broker"].nunique()) if not now12.empty else 0
+#Meglere med aktive annonser
 active_prev = int(prev12["broker"].nunique()) if not prev12.empty else 0
 active_delta_val = active_now - active_prev
-active_delta_pct = (active_delta_val / active_prev * 100) if active_prev > 0 else (100.0 if active_now > 0 else 0.0)
+_, active_delta_label = pct_change_label(active_now, active_prev)
 
-# Gj.snitt dager i markedet – placeholder
+#Gj.snitt dager i markedet – placeholder
 days_now = "–"
 days_delta_text = "–"
 
 st.markdown('<div class="mm-kpi-row">', unsafe_allow_html=True)
 kpi_card("Aktive annonser (siste 12 mnd)",
          f"{listings_now:,}".replace(",", " "),
-         f"{listings_delta_pct:+.1f}% vs forrige periode",
+         listings_delta_label,
          positive=(listings_delta_val >= 0))
 kpi_card("Total verdi av aktive boliger",
          fmt_compact_nok(omset_now),
-         f"{omset_delta_pct:+.1f}% vs forrige periode",
+         omset_delta_label,
          positive=(omset_delta_val >= 0))
 kpi_card("Meglere med aktive annonser",
          str(active_now),
-         f"{active_delta_pct:+.1f}% vs forrige periode",
+         active_delta_label,
          positive=(active_delta_val >= 0))
-kpi_card("Gj.snitt dager på markedet",
-         days_now,
-         days_delta_text,
-         positive=True)
+kpi_card("Estimert provisjonsgrunnlag",
+         fmt_compact_nok(commission_now),
+         commission_delta_label,
+         positive=(commission_delta_val >= 0))
 st.markdown('</div>', unsafe_allow_html=True)
-
-# -------------------- TOPP 5 MEGLERE / KONTOR --------------------
+if baseline_has_data:
+    st.markdown(f'<div class="mm-subtle">Første snapshot lagret: {baseline_label}</div>', unsafe_allow_html=True)
+#TOPP 5 MEGLERE/KONTOR
 CARD_STYLE = "width:100%;max-width:900px;margin:auto;"
 colL, colR = st.columns([1, 1], gap="large")
 brokers_total = int(flt["broker"].nunique()) if "broker" in flt.columns else 0
@@ -361,28 +501,54 @@ brokers_per_chain = (
     else pd.Series(dtype="int64")
 )
 
+if {"broker", "chain", "price", "listing_id"}.issubset(flt.columns) and not flt.empty:
+    brokers_grouped = (
+        flt.groupby(["broker", "chain"], dropna=False)
+        .agg(total_value=("price", "sum"), n=("listing_id", "count"))
+        .reset_index()
+    )
+    brokers_grouped["commission_base"] = brokers_grouped["total_value"] * COMMISSION_RATE
+    brokers_grouped["commission_avg"] = np.where(
+        brokers_grouped["n"] > 0,
+        brokers_grouped["commission_base"] / brokers_grouped["n"],
+        0.0
+    )
+else:
+    brokers_grouped = pd.DataFrame(columns=["broker", "chain", "total_value", "n", "commission_base", "commission_avg"])
+
+if {"chain", "price", "listing_id"}.issubset(flt.columns) and not flt.empty:
+    offices_grouped = (
+        flt.groupby(["chain"], dropna=False)
+        .agg(total_value=("price", "sum"), n=("listing_id", "count"))
+        .reset_index()
+    )
+    offices_grouped["commission_base"] = offices_grouped["total_value"] * COMMISSION_RATE
+    offices_grouped["commission_avg"] = np.where(
+        offices_grouped["n"] > 0,
+        offices_grouped["commission_base"] / offices_grouped["n"],
+        0.0
+    )
+else:
+    offices_grouped = pd.DataFrame(columns=["chain", "total_value", "n", "commission_base", "commission_avg"])
+
 with colL:
     st.markdown(f'<div class="mm-card" style="{CARD_STYLE}">', unsafe_allow_html=True)
-    st.markdown('<div class="mm-title">Flest aktive boliger – meglere</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="mm-subtle">Antall meglere i utvalget: {brokers_total}</div>', unsafe_allow_html=True)
-    st.markdown("""
+    st.markdown('<div class="mm-title">Størst provisjonsgrunnlag – meglere</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="mm-subtle">Antall meglere i utvalget: {brokers_total} – sortert på estimert provisjon ({COMMISSION_LABEL})</div>', unsafe_allow_html=True)
+    st.markdown(f"""
     <div style="display:flex;gap:16px;padding:0 8px 8px 8px;color:#aeb4be;font-size:13px;">
       <div style="width:40px;">#</div>
       <div style="flex:2;">Megler</div>
       <div style="flex:2;">Kontor</div>
       <div style="width:120px;text-align:center;">Meglere i kjeden</div>
       <div style="width:80px;text-align:center;">Aktive boliger</div>
-      <div style="width:160px;text-align:right;">Samlet verdi</div>
+      <div style="width:140px;text-align:right;">Samlet verdi</div>
+      <div style="width:140px;text-align:right;">Provisjon ({COMMISSION_LABEL})</div>
+      <div style="width:160px;text-align:right;">Snitt provisjon pr. bolig</div>
     </div>
     """, unsafe_allow_html=True)
 
-    brokers_now = (
-        flt.groupby(["broker", "chain"], dropna=False)
-        .agg(total_value=("price", "sum"), n=("listing_id", "count"))
-        .reset_index()
-        .sort_values("total_value", ascending=False)
-        .head(10)
-    )
+    brokers_now = brokers_grouped.sort_values("commission_base", ascending=False).head(10)
     container_style = "max-height:540px;overflow:auto;padding-right:4px;"
     st.markdown(f'<div style="{container_style}">', unsafe_allow_html=True)
     for i, row in brokers_now.reset_index(drop=True).iterrows():
@@ -391,6 +557,9 @@ with colL:
         chain = row["chain"]
         count = int(row["n"])
         total = fmt_nok(row["total_value"])
+        commission = fmt_nok(row["commission_base"])
+        avg_raw = row.get("commission_avg")
+        commission_avg = fmt_nok(avg_raw)
         broker_count = int(brokers_per_chain.get(chain, 0)) if not brokers_per_chain.empty else 0
         st.markdown(f"""
         <div style="display:flex;align-items:center;gap:16px;background:#161a20;border-radius:12px;padding:12px 8px;margin-bottom:8px;">
@@ -406,8 +575,14 @@ with colL:
           <div style="width:80px;text-align:center;">
             <span style="background:#23262B;color:#2f9e44;font-weight:700;padding:2px 12px;border-radius:999px;">{count}</span>
           </div>
-          <div style="width:160px;text-align:right;">
+          <div style="width:140px;text-align:right;">
             <span style="background:#23262B;color:#ffd700;font-weight:700;padding:2px 12px;border-radius:999px;">{total}</span>
+          </div>
+          <div style="width:140px;text-align:right;">
+            <span style="background:#23262B;color:#35d07f;font-weight:700;padding:2px 12px;border-radius:999px;">{commission}</span>
+          </div>
+          <div style="width:160px;text-align:right;">
+            <span style="background:#23262B;color:#89a7ff;font-weight:700;padding:2px 12px;border-radius:999px;">{commission_avg}</span>
           </div>
         </div>
         """, unsafe_allow_html=True)
@@ -416,26 +591,22 @@ with colL:
 
 with colR:
     st.markdown(f'<div class="mm-card" style="{CARD_STYLE}">', unsafe_allow_html=True)
-    st.markdown('<div class="mm-title">Flest aktive boliger – kontorer</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="mm-subtle">Antall meglere i utvalget: {brokers_total}</div>', unsafe_allow_html=True)
-    st.markdown("""
+    st.markdown('<div class="mm-title">Størst provisjonsgrunnlag – kontorer</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="mm-subtle">Antall meglere i utvalget: {brokers_total} – sortert på estimert provisjon ({COMMISSION_LABEL})</div>', unsafe_allow_html=True)
+    st.markdown(f"""
     <div style="display:flex;gap:16px;padding:0 8px 8px 8px;color:#aeb4be;font-size:13px;">
       <div style="width:40px;">#</div>
       <div style="flex:2;">Kontor</div>
       <div style="flex:2;">Kjede</div>
       <div style="width:120px;text-align:center;">Meglere i kjeden</div>
       <div style="width:80px;text-align:center;">Aktive boliger</div>
-      <div style="width:160px;text-align:right;">Samlet verdi</div>
+      <div style="width:140px;text-align:right;">Samlet verdi</div>
+      <div style="width:140px;text-align:right;">Provisjon ({COMMISSION_LABEL})</div>
+      <div style="width:160px;text-align:right;">Snitt provisjon pr. bolig</div>
     </div>
     """, unsafe_allow_html=True)
 
-    offices_now = (
-        flt.groupby(["chain"], dropna=False)
-        .agg(total_value=("price", "sum"), n=("listing_id", "count"))
-        .reset_index()
-        .sort_values("total_value", ascending=False)
-        .head(10)
-    )
+    offices_now = offices_grouped.sort_values("commission_base", ascending=False).head(10)
     st.markdown(f'<div style="{container_style}">', unsafe_allow_html=True)
     for i, row in offices_now.reset_index(drop=True).iterrows():
         rank = i + 1
@@ -443,6 +614,9 @@ with colR:
         chain = row["chain"]
         count = int(row["n"])
         total = fmt_nok(row["total_value"])
+        commission = fmt_nok(row["commission_base"])
+        avg_raw = row.get("commission_avg")
+        commission_avg = fmt_nok(avg_raw)
         broker_count = int(brokers_per_chain.get(chain, 0)) if not brokers_per_chain.empty else 0
         st.markdown(f"""
         <div style="display:flex;align-items:center;gap:16px;background:#161a20;border-radius:12px;padding:12px 8px;margin-bottom:8px;">
@@ -458,17 +632,218 @@ with colR:
           <div style="width:80px;text-align:center;">
             <span style="background:#23262B;color:#2f9e44;font-weight:700;padding:2px 12px;border-radius:999px;">{count}</span>
           </div>
-          <div style="width:160px;text-align:right;">
+          <div style="width:140px;text-align:right;">
             <span style="background:#23262B;color:#ffd700;font-weight:700;padding:2px 12px;border-radius:999px;">{total}</span>
+          </div>
+          <div style="width:140px;text-align:right;">
+            <span style="background:#23262B;color:#35d07f;font-weight:700;padding:2px 12px;border-radius:999px;">{commission}</span>
+          </div>
+          <div style="width:160px;text-align:right;">
+            <span style="background:#23262B;color:#89a7ff;font-weight:700;padding:2px 12px;border-radius:999px;">{commission_avg}</span>
           </div>
         </div>
         """, unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
+#summerer type
+type_summary = (
+    flt.groupby("property_type", dropna=False)
+      .agg(antall=("listing_id", "count"), total=("price", "sum"), snitt=("price", "mean"))
+      .reset_index()
+)
+if not type_summary.empty:
+    type_summary["property_type"] = type_summary["property_type"].fillna("(ukjent boligtype)")
+    type_summary = type_summary.sort_values("antall", ascending=False)
+
+#summerer pris
+price_summary = (
+    flt.groupby("price_band", dropna=False)
+      .agg(antall=("listing_id", "count"), total=("price", "sum"), snitt=("price", "mean"))
+      .reset_index()
+)
+if not price_summary.empty:
+    price_summary["price_band"] = price_summary["price_band"].astype(str)
+    order = PRICE_BAND_LABELS + ["(ukjent prissjikt)"]
+    price_summary["__order"] = price_summary["price_band"].apply(lambda x: order.index(x) if x in order else len(order))
+    price_summary = price_summary.sort_values("__order").drop(columns="__order")
+
+#summerer rolle
+role_summary = (
+    flt.groupby("broker_role", dropna=False)
+      .agg(antall=("listing_id", "count"), total=("price", "sum"))
+      .reset_index()
+)
+if not role_summary.empty:
+    role_summary["broker_role"] = role_summary["broker_role"].fillna("(ukjent rolle)")
+    role_summary = role_summary.sort_values("antall", ascending=False)
+
+st.markdown('<div class="mm-section-title">Boligtyper og prisfordeling</div>', unsafe_allow_html=True)
+type_col, price_col = st.columns([1, 1], gap="large")
+with type_col:
+    st.markdown('<div class="mm-card">', unsafe_allow_html=True)
+    st.markdown('<div class="mm-title">Fordeling per boligtype</div>', unsafe_allow_html=True)
+    if not type_summary.empty:
+        type_display = type_summary.assign(
+            Boligtype=lambda df: df["property_type"],
+            Antall=lambda df: df["antall"],
+            **{"Total verdi": type_summary["total"].apply(fmt_compact_nok),
+               "Snittpris": type_summary["snitt"].apply(fmt_nok)}
+        )[
+            ["Boligtype", "Antall", "Total verdi", "Snittpris"]
+        ]
+        st.dataframe(type_display, use_container_width=True, hide_index=True)
+    else:
+        st.info('Ingen boligtyper i utvalget.')
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with price_col:
+    st.markdown('<div class="mm-card">', unsafe_allow_html=True)
+    st.markdown('<div class="mm-title">Fordeling per prissjikt</div>', unsafe_allow_html=True)
+    if not price_summary.empty:
+        price_display = price_summary.assign(
+            Prissjikt=lambda df: df["price_band"],
+            Antall=lambda df: df["antall"],
+            **{"Total verdi": price_summary["total"].apply(fmt_compact_nok),
+               "Snittpris": price_summary["snitt"].apply(fmt_nok)}
+        )[
+            ["Prissjikt", "Antall", "Total verdi", "Snittpris"]
+        ]
+        st.dataframe(price_display, use_container_width=True, hide_index=True)
+    else:
+        st.info('Ingen prissjikt i utvalget.')
+    st.markdown('</div>', unsafe_allow_html=True)
+
+role_card = st.container()
+with role_card:
+    st.markdown('<div class="mm-card">', unsafe_allow_html=True)
+    st.markdown('<div class="mm-title">Meglerroller</div>', unsafe_allow_html=True)
+    if not role_summary.empty:
+        role_display = role_summary.assign(
+            Rolle=lambda df: df["broker_role"],
+            Antall=lambda df: df["antall"],
+            **{"Total verdi": role_summary["total"].apply(fmt_compact_nok)}
+        )[
+            ["Rolle", "Antall", "Total verdi"]
+        ]
+        st.dataframe(role_display, use_container_width=True, hide_index=True)
+    else:
+        st.info('Ingen meglerroller i utvalget.')
+    st.markdown('</div>', unsafe_allow_html=True)
+
+st.markdown('<div class="mm-section-title">Høyest snittprovisjon</div>', unsafe_allow_html=True)
+avg_colL, avg_colR = st.columns([1, 1], gap="large")
+
+with avg_colL:
+    st.markdown(f'<div class="mm-card" style="{CARD_STYLE}">', unsafe_allow_html=True)
+    st.markdown('<div class="mm-title">Høyest snittprovisjon – meglere</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="mm-subtle">Minst {MIN_LISTINGS_FOR_AVG} aktive boliger. Basert på estimert provisjon ({COMMISSION_LABEL}).</div>', unsafe_allow_html=True)
+    avg_brokers = brokers_grouped[brokers_grouped["n"] >= MIN_LISTINGS_FOR_AVG].copy()
+    if avg_brokers.empty:
+        st.info(f"Ingen meglere med minst {MIN_LISTINGS_FOR_AVG} aktive boliger i utvalget.")
+    else:
+        st.markdown(f"""
+        <div style="display:flex;gap:16px;padding:0 8px 8px 8px;color:#aeb4be;font-size:13px;">
+          <div style="width:40px;">#</div>
+          <div style="flex:2;">Megler</div>
+          <div style="flex:2;">Kontor</div>
+          <div style="width:120px;text-align:center;">Meglere i kjeden</div>
+          <div style="width:80px;text-align:center;">Aktive boliger</div>
+          <div style="width:150px;text-align:right;">Snitt provisjon</div>
+          <div style="width:150px;text-align:right;">Total provisjon</div>
+        </div>
+        """, unsafe_allow_html=True)
+        avg_container_style = "max-height:540px;overflow:auto;padding-right:4px;"
+        st.markdown(f'<div style="{avg_container_style}">', unsafe_allow_html=True)
+        top_avg_brokers = avg_brokers.sort_values("commission_avg", ascending=False).head(5)
+        for i, row in top_avg_brokers.reset_index(drop=True).iterrows():
+            rank = i + 1
+            name = row["broker"]
+            chain = row["chain"]
+            count = int(row["n"])
+            avg_text = fmt_nok(row.get("commission_avg"))
+            total_text = fmt_nok(row.get("commission_base"))
+            broker_count = int(brokers_per_chain.get(chain, 0)) if not brokers_per_chain.empty else 0
+            st.markdown(f"""
+            <div style="display:flex;align-items:center;gap:16px;background:#161a20;border-radius:12px;padding:12px 8px;margin-bottom:8px;">
+              <div style="width:40px;color:#9aa1ab;font-weight:600;">#{rank}</div>
+              <div style="flex:2;display:flex;align-items:center;">
+                <span class="mm-avatar" style="margin-right:8px;">{initials(name)}</span>
+                <span style="font-weight:600; color:#fff;">{name}</span>
+              </div>
+              <div style="flex:2;color:#aeb4be;">{chain}</div>
+              <div style="width:120px;text-align:center;">
+                <span style="background:#23262B;color:#9aa1ab;font-weight:700;padding:2px 12px;border-radius:999px;">{broker_count}</span>
+              </div>
+              <div style="width:80px;text-align:center;">
+                <span style="background:#23262B;color:#2f9e44;font-weight:700;padding:2px 12px;border-radius:999px;">{count}</span>
+              </div>
+              <div style="width:150px;text-align:right;">
+                <span style="background:#23262B;color:#89a7ff;font-weight:700;padding:2px 12px;border-radius:999px;">{avg_text}</span>
+              </div>
+              <div style="width:150px;text-align:right;">
+                <span style="background:#23262B;color:#35d07f;font-weight:700;padding:2px 12px;border-radius:999px;">{total_text}</span>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with avg_colR:
+    st.markdown(f'<div class="mm-card" style="{CARD_STYLE}">', unsafe_allow_html=True)
+    st.markdown('<div class="mm-title">Høyest snittprovisjon – kontorer</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="mm-subtle">Minst {MIN_LISTINGS_FOR_AVG} aktive boliger. Basert på estimert provisjon ({COMMISSION_LABEL}).</div>', unsafe_allow_html=True)
+    avg_offices = offices_grouped[offices_grouped["n"] >= MIN_LISTINGS_FOR_AVG].copy()
+    if avg_offices.empty:
+        st.info(f"Ingen kontorer med minst {MIN_LISTINGS_FOR_AVG} aktive boliger i utvalget.")
+    else:
+        st.markdown(f"""
+        <div style="display:flex;gap:16px;padding:0 8px 8px 8px;color:#aeb4be;font-size:13px;">
+          <div style="width:40px;">#</div>
+          <div style="flex:2;">Kontor</div>
+          <div style="width:120px;text-align:center;">Meglere i kjeden</div>
+          <div style="width:80px;text-align:center;">Aktive boliger</div>
+          <div style="width:150px;text-align:right;">Snitt provisjon</div>
+          <div style="width:150px;text-align:right;">Total provisjon</div>
+        </div>
+        """, unsafe_allow_html=True)
+        avg_container_style = "max-height:540px;overflow:auto;padding-right:4px;"
+        st.markdown(f'<div style="{avg_container_style}">', unsafe_allow_html=True)
+        top_avg_offices = avg_offices.sort_values("commission_avg", ascending=False).head(5)
+        for i, row in top_avg_offices.reset_index(drop=True).iterrows():
+            rank = i + 1
+            office = row["chain"]
+            count = int(row["n"])
+            avg_text = fmt_nok(row.get("commission_avg"))
+            total_text = fmt_nok(row.get("commission_base"))
+            broker_count = int(brokers_per_chain.get(office, 0)) if not brokers_per_chain.empty else 0
+            st.markdown(f"""
+            <div style="display:flex;align-items:center;gap:16px;background:#161a20;border-radius:12px;padding:12px 8px;margin-bottom:8px;">
+              <div style="width:40px;color:#9aa1ab;font-weight:600;">#{rank}</div>
+              <div style="flex:2;display:flex;align-items:center;">
+                <span class="mm-office-icon">🏢</span>
+                <span style="font-weight:600; color:#fff;">{office}</span>
+              </div>
+              <div style="width:120px;text-align:center;">
+                <span style="background:#23262B;color:#9aa1ab;font-weight:700;padding:2px 12px;border-radius:999px;">{broker_count}</span>
+              </div>
+              <div style="width:80px;text-align:center;">
+                <span style="background:#23262B;color:#2f9e44;font-weight:700;padding:2px 12px;border-radius:999px;">{count}</span>
+              </div>
+              <div style="width:150px;text-align:right;">
+                <span style="background:#23262B;color:#89a7ff;font-weight:700;padding:2px 12px;border-radius:999px;">{avg_text}</span>
+              </div>
+              <div style="width:150px;text-align:right;">
+                <span style="background:#23262B;color:#35d07f;font-weight:700;padding:2px 12px;border-radius:999px;">{total_text}</span>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
 st.write("")
 
-# -------------------- RANGERING: Vokser vs Faller (30d vs prev 30d) --------------------
+#RANGERING: Vokser vs Faller (30d vs prev 30d)
 st.markdown('<div class="mm-section-title">Endring i aktive boliger</div>', unsafe_allow_html=True)
 cGrow, cFall = st.columns(2)
 
@@ -479,6 +854,9 @@ portfolio_options = {
     "Siste 90 dager": 90,
     "Siste 180 dager": 180,
 }
+if baseline_has_data:
+    portfolio_options["Siden første snapshot"] = None
+
 portfolio_label = c8.selectbox(
     "Vindu for endring i aktive boliger",
     list(portfolio_options.keys()),
@@ -497,7 +875,15 @@ def window_split(df: pd.DataFrame, now_days=30) -> Tuple[pd.DataFrame, pd.DataFr
     prev = df[(df["published_dt"] >= start_prev) & (df["published_dt"] < start_now)].copy()
     return now, prev
 
-now_win, prev_win = window_split(flt, now_days=portfolio_window_days)
+if portfolio_window_days is None:
+    now_win = flt.copy()
+    prev_win = baseline_flt.copy()
+    grow_desc = f"Størst økning i aktive boliger siden første snapshot ({baseline_label})"
+    fall_desc = f"Størst nedgang i aktive boliger siden første snapshot ({baseline_label})"
+else:
+    now_win, prev_win = window_split(flt, now_days=portfolio_window_days)
+    grow_desc = f"Størst økning i aktive boliger ({portfolio_window_days} dager vs forrige {portfolio_window_days} dager)"
+    fall_desc = f"Størst nedgang i aktive boliger ({portfolio_window_days} dager vs forrige {portfolio_window_days} dager)"
 
 def deltas_per_broker(now_df: pd.DataFrame, prev_df: pd.DataFrame) -> pd.DataFrame:
     def agg(x: pd.DataFrame):
@@ -519,7 +905,7 @@ deltas = deltas_per_broker(now_win, prev_win)
 with cGrow:
     st.markdown('<div class="mm-card">', unsafe_allow_html=True)
     st.markdown('<div class="mm-title">Meglere med flere aktive boliger</div>', unsafe_allow_html=True)
-    st.markdown(f'<div style="color:#aeb4be;font-size:13px;margin-bottom:10px;">Størst økning i aktive boliger ({portfolio_window_days} dager vs forrige {portfolio_window_days} dager)</div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="color:#aeb4be;font-size:13px;margin-bottom:10px;">{grow_desc}</div>', unsafe_allow_html=True)
     grow = deltas.sort_values("delta_value", ascending=False).head(5)
     for i, row in grow.reset_index(drop=True).iterrows():
         rank = i+1
@@ -547,7 +933,7 @@ with cGrow:
 with cFall:
     st.markdown('<div class="mm-card">', unsafe_allow_html=True)
     st.markdown('<div class="mm-title">Meglere med færre aktive boliger</div>', unsafe_allow_html=True)
-    st.markdown(f'<div style="color:#aeb4be;font-size:13px;margin-bottom:10px;">Størst nedgang i aktive boliger ({portfolio_window_days} dager vs forrige {portfolio_window_days} dager)</div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="color:#aeb4be;font-size:13px;margin-bottom:10px;">{fall_desc}</div>', unsafe_allow_html=True)
     fall = deltas.sort_values("delta_value", ascending=True).head(5)
     for i, row in fall.reset_index(drop=True).iterrows():
         rank = i+1
@@ -572,7 +958,7 @@ with cFall:
         """, unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-# -------------------- Raw table --------------------
+#Raw table
 st.write("")
 st.subheader("Alle aktive annonser")
 st.caption(f"Data hentet {snapshot_ts} (Europe/Oslo). Tallene viser aktive annonser som er ute i markedet nå.")

@@ -393,6 +393,23 @@ body { background: #0d1015; }
 .mm-th { color:#aeb4be; font-size:13px; font-weight:600; background:transparent; }
 .mm-td { font-size:15px; background:#161a20; border-radius:10px; }
 .mm-office-icon { width:28px; height:28px; border-radius:999px; background:#1d232b; display:inline-flex; align-items:center; justify-content:center; margin-right:8px; color:#7fd188; font-weight:700; font-size:18px; }
+@media (max-width: 1200px) {
+  .mm-kpi-row { grid-template-columns: repeat(2, 1fr); }
+  .mm-card { max-width: 100%; }
+}
+@media (max-width: 768px) {
+  .mm-kpi-row { grid-template-columns: 1fr; }
+  .mm-row { flex-direction: column; align-items: flex-start; }
+  .mm-row .mm-right { text-align: left; margin-top: 8px; }
+  .mm-row .mm-rank { width: auto; margin-bottom: 6px; }
+  .mm-card { padding: 12px; }
+  .mm-section-title { font-size: 16px; }
+  .mm-kpi-value-green, .mm-kpi-value-red { font-size: 24px; }
+}
+@media (max-width: 600px) {
+  .mm-table { font-size: 13px; }
+  .mm-th, .mm-td { padding: 8px 6px; }
+}
 </style>
 """, unsafe_allow_html=True)
 

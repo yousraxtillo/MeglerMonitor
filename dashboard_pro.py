@@ -49,6 +49,7 @@ def fmt_nok(x: float | int | None) -> str:
     except Exception:
         return "–"
 
+
 def fmt_compact_nok(x: float | int | None) -> str:
     """12,4 mrd / 1,2 mill / 123 000 (for KPI row, matches screenshot vibe)."""
     if x is None or (isinstance(x, float) and pd.isna(x)):
@@ -59,6 +60,11 @@ def fmt_compact_nok(x: float | int | None) -> str:
     if abs(v) >= 1_000_000:      # million
         return f"{v/1_000_000:.1f}".replace(".", ",") + " mill"
     return f"{int(round(v)):,}".replace(",", " ")
+
+
+def fmt_compact_nok_with_kr(x: float | int | None) -> str:
+    base = fmt_compact_nok(x)
+    return base if base == "–" else base + " kr"
 
 def fmt_delta(value: float | None, pct: float | None) -> str:
     if value is None and pct is None:
@@ -556,10 +562,10 @@ with colL:
         name = row["broker"]
         chain = row["chain"]
         count = int(row["n"])
-        total = fmt_nok(row["total_value"])
-        commission = fmt_nok(row["commission_base"])
+        total = fmt_compact_nok_with_kr(row["total_value"])
+        commission = fmt_compact_nok_with_kr(row["commission_base"])
         avg_raw = row.get("commission_avg")
-        commission_avg = fmt_nok(avg_raw)
+        commission_avg = fmt_compact_nok_with_kr(avg_raw)
         broker_count = int(brokers_per_chain.get(chain, 0)) if not brokers_per_chain.empty else 0
         st.markdown(f"""
         <div style="display:flex;align-items:center;gap:16px;background:#161a20;border-radius:12px;padding:12px 8px;margin-bottom:8px;">
@@ -613,10 +619,10 @@ with colR:
         office = row["chain"]
         chain = row["chain"]
         count = int(row["n"])
-        total = fmt_nok(row["total_value"])
-        commission = fmt_nok(row["commission_base"])
+        total = fmt_compact_nok_with_kr(row["total_value"])
+        commission = fmt_compact_nok_with_kr(row["commission_base"])
         avg_raw = row.get("commission_avg")
-        commission_avg = fmt_nok(avg_raw)
+        commission_avg = fmt_compact_nok_with_kr(avg_raw)
         broker_count = int(brokers_per_chain.get(chain, 0)) if not brokers_per_chain.empty else 0
         st.markdown(f"""
         <div style="display:flex;align-items:center;gap:16px;background:#161a20;border-radius:12px;padding:12px 8px;margin-bottom:8px;">
@@ -687,8 +693,8 @@ with type_col:
         type_display = type_summary.assign(
             Boligtype=lambda df: df["property_type"],
             Antall=lambda df: df["antall"],
-            **{"Total verdi": type_summary["total"].apply(fmt_compact_nok),
-               "Snittpris": type_summary["snitt"].apply(fmt_nok)}
+            **{"Total verdi": type_summary["total"].apply(fmt_compact_nok_with_kr),
+               "Snittpris": type_summary["snitt"].apply(fmt_compact_nok_with_kr)}
         )[
             ["Boligtype", "Antall", "Total verdi", "Snittpris"]
         ]
@@ -704,8 +710,8 @@ with price_col:
         price_display = price_summary.assign(
             Prissjikt=lambda df: df["price_band"],
             Antall=lambda df: df["antall"],
-            **{"Total verdi": price_summary["total"].apply(fmt_compact_nok),
-               "Snittpris": price_summary["snitt"].apply(fmt_nok)}
+            **{"Total verdi": price_summary["total"].apply(fmt_compact_nok_with_kr),
+               "Snittpris": price_summary["snitt"].apply(fmt_compact_nok_with_kr)}
         )[
             ["Prissjikt", "Antall", "Total verdi", "Snittpris"]
         ]
@@ -722,7 +728,7 @@ with role_card:
         role_display = role_summary.assign(
             Rolle=lambda df: df["broker_role"],
             Antall=lambda df: df["antall"],
-            **{"Total verdi": role_summary["total"].apply(fmt_compact_nok)}
+            **{"Total verdi": role_summary["total"].apply(fmt_compact_nok_with_kr)}
         )[
             ["Rolle", "Antall", "Total verdi"]
         ]
@@ -761,8 +767,8 @@ with avg_colL:
             name = row["broker"]
             chain = row["chain"]
             count = int(row["n"])
-            avg_text = fmt_nok(row.get("commission_avg"))
-            total_text = fmt_nok(row.get("commission_base"))
+            avg_text = fmt_compact_nok_with_kr(row.get("commission_avg"))
+            total_text = fmt_compact_nok_with_kr(row.get("commission_base"))
             broker_count = int(brokers_per_chain.get(chain, 0)) if not brokers_per_chain.empty else 0
             st.markdown(f"""
             <div style="display:flex;align-items:center;gap:16px;background:#161a20;border-radius:12px;padding:12px 8px;margin-bottom:8px;">
@@ -814,8 +820,8 @@ with avg_colR:
             rank = i + 1
             office = row["chain"]
             count = int(row["n"])
-            avg_text = fmt_nok(row.get("commission_avg"))
-            total_text = fmt_nok(row.get("commission_base"))
+            avg_text = fmt_compact_nok_with_kr(row.get("commission_avg"))
+            total_text = fmt_compact_nok_with_kr(row.get("commission_base"))
             broker_count = int(brokers_per_chain.get(office, 0)) if not brokers_per_chain.empty else 0
             st.markdown(f"""
             <div style="display:flex;align-items:center;gap:16px;background:#161a20;border-radius:12px;padding:12px 8px;margin-bottom:8px;">

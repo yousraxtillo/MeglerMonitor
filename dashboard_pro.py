@@ -1,14 +1,26 @@
 from pathlib import Path
 import math
+import re
+from collections import Counter
 from typing import Tuple
 import pandas as pd
 import numpy as np
 import streamlit as st
 
+
+# Skrive liste slik at vi vet hvordan vi utfører oppgaven. Vi ser på hva som
+#  må bli gjort og fullførerr det sakte. Så vi skriver ikke alle todo i amtalen men vu legger
+#  til 1 og en slik at det ikkke oppstår noe feil
+
 #App setup
 st.set_page_config(page_title="MeglerMonitor", layout="wide")
 OUT = (Path(__file__).resolve().parent / "out").expanduser()
 OUT.mkdir(parents=True, exist_ok=True)
+
+if "phase2_view_mode" not in st.session_state:
+    st.session_state["phase2_view_mode"] = "list"
+if "phase2_selected" not in st.session_state:
+    st.session_state["phase2_selected"] = None
 
 #Helpers
 @st.cache_data
@@ -76,6 +88,539 @@ def fmt_delta(value: float | None, pct: float | None) -> str:
     if pct is not None and not pd.isna(pct):
         parts.append(f"({pct:+.1f}%)")
     return " ".join(parts)
+
+
+POSTAL_CODE_RE = re.compile(r"(\d{4})")
+
+_TOKEN_REPLACEMENTS = {
+    "ø": "o",
+    "å": "a",
+    "æ": "ae",
+    "é": "e",
+    "ü": "u",
+    "ö": "o",
+    "ä": "a",
+}
+
+DISTRICT_KEYWORDS = {
+    "gronland": "Grønland",
+    "toy en": "Tøyen",
+    "tøyen": "Tøyen",
+    "bjorvika": "Bjørvika",
+    "ensjo": "Ensjø",
+    "grunerlokka": "Grünerløkka",
+    "grünerløkka": "Grünerløkka",
+    "sagene": "Sagene",
+    "st hanshaugen": "St. Hanshaugen",
+    "majorstuen": "Majorstuen",
+    "frogner": "Frogner",
+    "akerselva": "Akerselva",
+    "aker brygge": "Aker Brygge",
+    "bjerke": "Bjerke",
+    "loren": "Løren",
+    "løren": "Løren",
+    "hasle": "Hasle",
+    "grefsen": "Grefsen",
+    "lambertseter": "Lambertseter",
+    "bjorndal": "Bjørndal",
+    "holtet": "Holtet",
+    "ulven": "Ulven",
+    "ulvenbyen": "Ulven",
+    "opp sal": "Oppsal",
+    "oppsal": "Oppsal",
+    "malerhaugen": "Malerhaugen",
+    "eternittkollen": "Eternittkollen",
+    "skoyen": "Skøyen",
+    "skøyen": "Skøyen",
+    "stovner": "Stovner",
+    "alna": "Alna",
+    "nordstrand": "Nordstrand",
+    "ostensjo": "Østensjø",
+    "østensjø": "Østensjø",
+    "sinsen": "Sinsen",
+    "ryen": "Ryen",
+    "byen": "Sentrum",
+    "gamle oslo": "Gamle Oslo",
+}
+
+POSTAL_DISTRICT_BANDS = [
+    (180, 199, "Grønland"),
+    (200, 299, "Frogner"),
+    (350, 369, "St. Hanshaugen"),
+    (400, 489, "Sagene"),
+    (500, 579, "Grünerløkka"),
+    (580, 599, "Gamle Oslo"),
+    (600, 699, "Oslo sør"),
+    (700, 799, "Oslo vest"),
+    (800, 899, "Oslo nord"),
+    (900, 999, "Oslo nordøst"),
+]
+
+
+def _normalize_token(value: str | None) -> str:
+    if not value:
+        return ""
+    lowered = value.lower()
+    for src, dst in _TOKEN_REPLACEMENTS.items():
+        lowered = lowered.replace(src, dst)
+    lowered = re.sub(r"[^a-z0-9 ]+", " ", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def extract_postal_code(address: str | None) -> str | None:
+    if not address or pd.isna(address):
+        return None
+    match = POSTAL_CODE_RE.search(str(address))
+    return match.group(1) if match else None
+
+
+def infer_district(city: str | None, address: str | None, chain: str | None) -> str | None:
+    if not city or pd.isna(city):
+        return None
+    city_norm = _normalize_token(city)
+    if city_norm != "oslo":
+        return None
+
+    tokens: set[str] = set()
+    for raw in (address, chain):
+        if not raw or pd.isna(raw):
+            continue
+        text = str(raw)
+        tokens.add(_normalize_token(text))
+        for part in re.split(r"[\s,;/\\-]", text):
+            norm = _normalize_token(part)
+            if norm:
+                tokens.add(norm)
+
+    for token in sorted(tokens, key=len, reverse=True):
+        if token in DISTRICT_KEYWORDS:
+            return DISTRICT_KEYWORDS[token]
+
+    postal_code = extract_postal_code(address)
+    if postal_code:
+        try:
+            postal_int = int(postal_code)
+        except ValueError:
+            postal_int = None
+        if postal_int is not None:
+            for low, high, label in POSTAL_DISTRICT_BANDS:
+                if low <= postal_int <= high:
+                    return label
+    return None
+
+
+def most_common_value(series: pd.Series, fallback: str) -> str:
+    if series is None or series.empty:
+        return fallback
+    cleaned = series.dropna()
+    if cleaned.empty:
+        return fallback
+    modes = cleaned.mode()
+    if modes.empty:
+        return str(cleaned.iloc[0])
+    return str(modes.iloc[0])
+
+
+def _segment_summary_tuple(series: pd.Series) -> tuple[str, str | None]:
+    if series is None or series.empty:
+        return "–", None
+    counts = series.fillna("(ukjent segment)").value_counts()
+    if counts.empty:
+        return "–", None
+    dominant = counts.index[0]
+    top_two = counts.head(2)
+    parts = [f"{name} ({count})" for name, count in top_two.items()]
+    return ", ".join(parts), dominant
+
+
+def _location_summary_tuple(series: pd.Series) -> tuple[str, str | None]:
+    if series is None or series.empty:
+        return "–", None
+    counts = series.fillna("(ukjent bydel)").value_counts()
+    if counts.empty:
+        return "–", None
+    primary = counts.index[0]
+    parts = [f"{name} ({count})" for name, count in counts.head(2).items()]
+    return ", ".join(parts), primary
+
+
+BROKER_KEY_SEP = "||"
+
+
+def build_broker_ranking(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(
+            columns=[
+                "broker",
+                "chain",
+                "city",
+                "district",
+                "broker_role",
+                "total_sales",
+                "total_value",
+                "avg_price",
+                "latest_listing",
+                "segment_summary",
+                "dominant_segment",
+                "location_summary",
+                "primary_location",
+                "broker_key",
+                "high_volume",
+            ]
+        )
+
+    group_cols = ["broker", "chain"]
+
+    aggregated = (
+        df.groupby(group_cols, dropna=False)
+        .agg(
+            total_sales=("listing_id", "count"),
+            total_value=("price", "sum"),
+            avg_price=("price", "mean"),
+            city=("city", lambda s: most_common_value(s, "(ukjent by)")),
+            district=("district", lambda s: most_common_value(s, "(ukjent bydel)")),
+            broker_role=("broker_role", lambda s: most_common_value(s, "(ukjent rolle)")),
+            latest_listing=("published_dt", "max"),
+        )
+        .reset_index()
+    )
+
+    segment_data = (
+        df.groupby(group_cols, dropna=False)["property_type"]
+        .apply(_segment_summary_tuple)
+        .reset_index(name="segment_tuple")
+    )
+    if not segment_data.empty:
+        segment_data[["segment_summary", "dominant_segment"]] = pd.DataFrame(
+            segment_data["segment_tuple"].tolist(), index=segment_data.index
+        )
+        segment_data = segment_data.drop(columns=["segment_tuple"])
+    else:
+        segment_data = pd.DataFrame(columns=group_cols + ["segment_summary", "dominant_segment"])
+
+    location_data = (
+        df.groupby(group_cols, dropna=False)["district"]
+        .apply(_location_summary_tuple)
+        .reset_index(name="location_tuple")
+    )
+    if not location_data.empty:
+        location_data[["location_summary", "primary_location"]] = pd.DataFrame(
+            location_data["location_tuple"].tolist(), index=location_data.index
+        )
+        location_data = location_data.drop(columns=["location_tuple"])
+    else:
+        location_data = pd.DataFrame(columns=group_cols + ["location_summary", "primary_location"])
+
+    ranking = aggregated.merge(segment_data, on=group_cols, how="left")
+    ranking = ranking.merge(location_data, on=group_cols, how="left")
+
+    ranking["total_value"] = ranking["total_value"].fillna(0.0)
+    ranking["avg_price"] = ranking["avg_price"].fillna(0.0)
+    ranking["segment_summary"] = ranking["segment_summary"].fillna("–")
+    ranking["dominant_segment"] = ranking["dominant_segment"].fillna("(ukjent segment)")
+    ranking["location_summary"] = ranking["location_summary"].fillna("–")
+    ranking["primary_location"] = ranking["primary_location"].fillna("(ukjent bydel)")
+
+    ranking["broker_key"] = ranking.apply(
+        lambda row: f"{row['broker']}{BROKER_KEY_SEP}{row['chain']}", axis=1
+    )
+
+    if not ranking.empty:
+        threshold = (
+            ranking["total_value"].quantile(0.9)
+            if len(ranking) >= 5
+            else ranking["total_value"].median()
+        )
+        ranking["high_volume"] = ranking["total_value"] >= threshold
+    else:
+        ranking["high_volume"] = False
+
+    return ranking
+
+
+def render_phase2_list(ranking: pd.DataFrame) -> None:
+    st.markdown("<div class=\"mm-section-title\">Rangert liste over meglere</div>", unsafe_allow_html=True)
+
+    top_n_default = st.session_state.setdefault("phase2_top_n", 12)
+    top_n = st.selectbox(
+        "Vis topp",
+        options=[6, 9, 12, 24],
+        index=[6, 9, 12, 24].index(top_n_default) if top_n_default in {6, 9, 12, 24} else 2,
+        help="Velg hvor mange meglere som vises i oversikten.",
+    )
+    st.session_state["phase2_top_n"] = top_n
+
+    subset = ranking.head(top_n)
+    if subset.empty:
+        st.info("Ingen meglere matcher filtrene.")
+        return
+
+    columns_per_row = 3
+    rows = (len(subset) + columns_per_row - 1) // columns_per_row
+    for row_idx in range(rows):
+        cols = st.columns(columns_per_row)
+        for col_idx in range(columns_per_row):
+            item_index = row_idx * columns_per_row + col_idx
+            if item_index >= len(subset):
+                cols[col_idx].empty()
+                continue
+            row = subset.iloc[item_index]
+            rank = int(row.get("rank", item_index + 1))
+            total_value = fmt_compact_nok_with_kr(row.get("total_value"))
+            avg_price = fmt_compact_nok_with_kr(row.get("avg_price"))
+            card_html = f"""
+            <div class="mm-card" style="padding:16px; min-height:200px; display:flex;flex-direction:column;justify-content:space-between;">
+              <div>
+                <div class="mm-subtle" style="margin-bottom:6px;">#{rank}</div>
+                <div style="font-weight:700;font-size:18px;color:#fff;">{row['broker']}</div>
+                <div class="mm-subtle" style="margin-top:2px;">{row.get('chain','')}</div>
+                {'<div class="mm-chip up" style="margin-top:6px;">Høyvolum</div>' if row.get('high_volume') else ''}
+                <div class="mm-subtle" style="margin-top:10px;">{row.get('city','')} · {row.get('primary_location','')}</div>
+                <div class="mm-subtle" style="margin-top:6px;">{row.get('segment_summary','–')}</div>
+              </div>
+              <div style="margin-top:12px;">
+                <div style="display:flex;justify-content:space-between;font-size:13px;color:#aeb4be;">
+                  <span>Salg</span><span>{int(row.get('total_sales',0))}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:13px;color:#aeb4be;">
+                  <span>Samlet verdi</span><span>{total_value}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:13px;color:#aeb4be;">
+                  <span>Snittpris</span><span>{avg_price}</span>
+                </div>
+              </div>
+            </div>
+            """
+            cols[col_idx].markdown(card_html, unsafe_allow_html=True)
+            button_key = f"phase2_open_{row['broker_key']}_card"
+            if cols[col_idx].button("Åpne meglerkort", key=button_key, use_container_width=True):
+                st.session_state["phase2_view_mode"] = "profile"
+                st.session_state["phase2_selected"] = row["broker_key"]
+                st.rerun()
+
+    with st.expander("Se hele listen i tabellform"):
+        display_df = ranking[["rank", "broker", "chain", "primary_location", "dominant_segment", "total_sales", "total_value", "avg_price"]].copy()
+        display_df["total_value"] = display_df["total_value"].apply(fmt_compact_nok_with_kr)
+        display_df["avg_price"] = display_df["avg_price"].apply(fmt_compact_nok_with_kr)
+        display_df = display_df.rename(columns={
+            "rank": "#",
+            "broker": "Megler",
+            "chain": "Kontor",
+            "primary_location": "Bydel",
+            "dominant_segment": "Segment",
+            "total_sales": "Salg",
+            "total_value": "Samlet verdi",
+            "avg_price": "Snittpris",
+        })
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+
+def _growth_last_periods(df_in: pd.DataFrame, days: int = 90) -> tuple[int, int]:
+    if df_in is None or df_in.empty or "published_dt" not in df_in.columns:
+        return 0, 0
+    now = pd.Timestamp.utcnow()
+    current_start = now - pd.Timedelta(days=days)
+    prev_start = current_start - pd.Timedelta(days=days)
+    current = df_in[df_in["published_dt"] >= current_start]
+    prev = df_in[(df_in["published_dt"] >= prev_start) & (df_in["published_dt"] < current_start)]
+    return int(len(current)), int(len(prev))
+
+
+def render_phase2_profile(selected_key: str,
+                          ranking: pd.DataFrame,
+                          df_filtered: pd.DataFrame,
+                          baseline_filtered: pd.DataFrame | None) -> None:
+    if not selected_key:
+        st.info("Ingen megler valgt.")
+        return
+
+    try:
+        row = ranking.set_index("broker_key").loc[selected_key]
+    except KeyError:
+        st.warning("Valgt megler finnes ikke lenger i utvalget.")
+        st.session_state["phase2_view_mode"] = "list"
+        st.session_state["phase2_selected"] = None
+        st.rerun()
+        return
+    broker_name = row["broker"]
+    chain_name = row["chain"]
+
+    back_col, _ = st.columns([0.3, 2.7])
+    if back_col.button("← Tilbake til liste", key="phase2_back"):
+        st.session_state["phase2_view_mode"] = "list"
+        st.session_state["phase2_selected"] = None
+        st.rerun()
+
+    st.markdown("<div class=\"mm-section-title\">Meglerkort</div>", unsafe_allow_html=True)
+    header_md = f"**{broker_name}**<br/>{chain_name}"
+    st.markdown(header_md, unsafe_allow_html=True)
+    meta_line = f"{row.get('broker_role', '(ukjent rolle)')} · {row.get('city', '')} — {row.get('primary_location', '')}"
+    st.caption(meta_line)
+    if row.get("high_volume"):
+        st.success("Denne megleren er i høyvolum-segmentet for gjeldende filtrering.")
+
+    broker_subset = df_filtered[(df_filtered["broker"] == broker_name) & (df_filtered["chain"] == chain_name)]
+    baseline_subset = (
+        baseline_filtered[(baseline_filtered["broker"] == broker_name) & (baseline_filtered["chain"] == chain_name)]
+        if baseline_filtered is not None else pd.DataFrame()
+    )
+
+    segment_counts = (
+        broker_subset["property_type"].value_counts().rename_axis("Segment").reset_index(name="Antall")
+        if not broker_subset.empty else pd.DataFrame(columns=["Segment", "Antall"])
+    )
+    location_counts = (
+        broker_subset["district"].value_counts().rename_axis("Bydel").reset_index(name="Antall")
+        if not broker_subset.empty else pd.DataFrame(columns=["Bydel", "Antall"])
+    )
+
+    recent_now, recent_prev = _growth_last_periods(broker_subset, days=90)
+    _, recent_delta_text = pct_change_label(recent_now, recent_prev, suffix="siste 90 dager vs foregående 90")
+
+    total_sales = int(row.get("total_sales", 0))
+    total_value = fmt_compact_nok_with_kr(row.get("total_value"))
+    avg_price = fmt_compact_nok_with_kr(row.get("avg_price"))
+    baseline_count = int(len(baseline_subset)) if not baseline_subset.empty else 0
+    delta_vs_baseline = total_sales - baseline_count
+
+    st.markdown("**Segmenter & lokasjoner**")
+    overview_seg, overview_loc = st.columns(2)
+
+    if segment_counts.empty:
+        overview_seg.info("Ingen segmentdata i utvalget.")
+    else:
+        seg_total = int(segment_counts["Antall"].sum())
+        top_segment = segment_counts.iloc[0]
+        seg_share = (top_segment["Antall"] / seg_total * 100) if seg_total else 0
+        seg_toplist = ", ".join(
+            f"{row['Segment']} ({row['Antall']})" for _, row in segment_counts.head(3).iterrows()
+        )
+        overview_seg.markdown(
+            f"""
+            <div class="mm-card" style="padding:14px;">
+              <div class="mm-title">Dominerende segment</div>
+              <div style="font-size:18px;font-weight:700;color:#fff;">{top_segment['Segment']}</div>
+              <div class="mm-subtle">{top_segment['Antall']} salg · {seg_share:.0f}% av porteføljen</div>
+              <div class="mm-subtle" style="margin-top:6px;">Toppliste: {seg_toplist}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    if location_counts.empty:
+        overview_loc.info("Ingen bydelsdata tilgjengelig.")
+    else:
+        loc_total = int(location_counts["Antall"].sum())
+        top_loc = location_counts.iloc[0]
+        loc_share = (top_loc["Antall"] / loc_total * 100) if loc_total else 0
+        loc_toplist = ", ".join(
+            f"{row['Bydel']} ({row['Antall']})" for _, row in location_counts.head(3).iterrows()
+        )
+        overview_loc.markdown(
+            f"""
+            <div class="mm-card" style="padding:14px;">
+              <div class="mm-title">Største lokasjon</div>
+              <div style="font-size:18px;font-weight:700;color:#fff;">{top_loc['Bydel']}</div>
+              <div class="mm-subtle">{top_loc['Antall']} salg · {loc_share:.0f}% av porteføljen</div>
+              <div class="mm-subtle" style="margin-top:6px;">Toppliste: {loc_toplist}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Antall salg (utvalg)", total_sales, delta_vs_baseline)
+    k2.metric("Samlet verdi", total_value)
+    k3.metric("Snittpris", avg_price)
+    k4.metric("Utvikling", f"{recent_now} salg", recent_delta_text)
+
+    c_seg, c_loc = st.columns(2)
+    if segment_counts.empty:
+        c_seg.info("Ingen segmentdata i utvalget.")
+    else:
+        c_seg.markdown("**Segmentfordeling**")
+        c_seg.dataframe(segment_counts, use_container_width=True)
+
+    if location_counts.empty:
+        c_loc.info("Ingen bydelsdata tilgjengelig.")
+    else:
+        c_loc.markdown("**Lokasjoner**")
+        c_loc.dataframe(location_counts, use_container_width=True)
+
+    price_col, trend_col = st.columns([1.1, 1.9])
+    prices = broker_subset["price"].dropna()
+    if prices.empty:
+        price_col.info("Prisdata mangler for utvalget.")
+    else:
+        price_stats = pd.DataFrame(
+            {
+                "Nøkkel": ["Min", "Median", "Snitt", "Max"],
+                "Verdi": [fmt_nok(prices.min()), fmt_nok(prices.median()), fmt_nok(prices.mean()), fmt_nok(prices.max())],
+            }
+        )
+        price_col.markdown("**Prisnivåer**")
+        price_col.dataframe(price_stats, use_container_width=True)
+
+    if "published_dt" in broker_subset.columns and not broker_subset.empty:
+        trend_col.markdown("**Salg over tid**")
+        timeline = (
+            broker_subset.dropna(subset=["published_dt"])
+            .set_index("published_dt")
+            .resample("M")["listing_id"].count()
+        )
+        if not timeline.empty:
+            timeline.index = timeline.index.tz_convert("Europe/Oslo")
+            trend_col.line_chart(timeline)
+        else:
+            trend_col.info("Ikke nok data for tidsserie.")
+    else:
+        trend_col.info("Ingen tidsstempler tilgjengelig for historikk.")
+
+    st.markdown("**Peer comparison**")
+    peers = ranking[
+        (ranking["broker_key"] != selected_key)
+        & (ranking["primary_location"] == row.get("primary_location"))
+        & (ranking["dominant_segment"] == row.get("dominant_segment"))
+    ].copy()
+    if peers.empty:
+        st.info("Ingen relevante peers funnet innen samme segment/bydel.")
+    else:
+        peer_display = peers.sort_values("total_value", ascending=False).head(5)
+        peer_display = peer_display[["broker", "chain", "total_sales", "total_value", "avg_price"]]
+        peer_display["total_value"] = peer_display["total_value"].apply(fmt_compact_nok_with_kr)
+        peer_display["avg_price"] = peer_display["avg_price"].apply(fmt_compact_nok_with_kr)
+        peer_display = peer_display.rename(columns={
+            "broker": "Megler",
+            "chain": "Kontor",
+            "total_sales": "Salg",
+            "total_value": "Verdi",
+            "avg_price": "Snittpris",
+        })
+        st.dataframe(peer_display, use_container_width=True)
+
+    st.markdown("**Du vil også like**")
+    recommendations = ranking[ranking["broker_key"] != selected_key].copy()
+    if recommendations.empty:
+        st.info("Ingen andre meglere i rangeringen.")
+    else:
+        recommendations["segment_match"] = recommendations["dominant_segment"] == row.get("dominant_segment")
+        recommendations["district_match"] = recommendations["primary_location"] == row.get("primary_location")
+        recommendations["score"] = (
+            recommendations["segment_match"].astype(int) * 2 + recommendations["district_match"].astype(int)
+        )
+        rec_top = recommendations.sort_values([
+            "score", "total_value"
+        ], ascending=[False, False]).head(3)
+        if rec_top.empty:
+            st.info("Ingen forslag tilgjengelig for nå.")
+        else:
+            for _, rec in rec_top.iterrows():
+                st.markdown(
+                    f"- **{rec['broker']}** ({rec['chain']}) – {rec['dominant_segment']} · {rec['primary_location']}"
+                )
+
+    st.markdown("**Profilinformasjon**")
+    st.info("LinkedIn-integrasjon og erfaringsdata er ikke hentet ennå. Legg til `out/broker_profiles.csv` med kolonnene `broker`, `chain`, `linkedin_url`, `experience_years`, `age` for å berike kortet.")
 
 
 STATUS_LABELS = {
@@ -199,6 +744,21 @@ def to_dt_safe(s: pd.Series) -> pd.Series:
     cleaned = cleaned.replace({'': pd.NA, 'nan': pd.NA, 'None': pd.NA, 'NaT': pd.NA})
     return pd.to_datetime(cleaned, errors='coerce', utc=True, format='ISO8601')
 
+
+def enforce_min_sales(df: pd.DataFrame, threshold: int) -> pd.DataFrame:
+    if threshold <= 0 or df is None or df.empty:
+        return df
+    required_cols = {"broker", "chain", "listing_id"}
+    if not required_cols.issubset(df.columns):
+        return df
+    counts = df.groupby(["broker", "chain"], dropna=False)["listing_id"].count()
+    qualifying = counts[counts >= threshold]
+    if qualifying.empty:
+        return df.iloc[0:0].copy()
+    qualifying = qualifying.reset_index()[["broker", "chain"]]
+    filtered = df.merge(qualifying.assign(_keep=True), on=["broker", "chain"], how="inner")
+    return filtered.drop(columns="_keep")
+
 #klargjør df
 def prepare_dataframe(df: pd.DataFrame | None) -> pd.DataFrame:
     if df is None:
@@ -234,6 +794,20 @@ def prepare_dataframe(df: pd.DataFrame | None) -> pd.DataFrame:
             out.loc[missing_city, "city"] = out.loc[missing_city, "address"].apply(infer_city_from_address)
         out["city"] = out["city"].apply(normalize_case)
 
+    if "address" in out.columns:
+        out["postal_code"] = out["address"].apply(extract_postal_code)
+    else:
+        out["postal_code"] = None
+
+    if {"city", "address", "chain"}.issubset(out.columns):
+        out["district"] = out.apply(
+            lambda row: infer_district(row.get("city"), row.get("address"), row.get("chain")),
+            axis=1,
+        )
+    else:
+        out["district"] = None
+    out["district"] = out["district"].fillna("(ukjent bydel)")
+
     if "status" in out.columns:
         out["status"] = out["status"].apply(normalize_status)
 
@@ -261,9 +835,11 @@ def prepare_dataframe(df: pd.DataFrame | None) -> pd.DataFrame:
 #appliserer filtre
 def apply_filters(df: pd.DataFrame | None,
                   city: str,
+                  districts: list[str],
                   chains: list[str],
                   chain_keyword: str,
                   roles: list[str],
+                  segments: list[str],
                   sources: list[str],
                   search: str,
                   period: str) -> pd.DataFrame:
@@ -277,6 +853,9 @@ def apply_filters(df: pd.DataFrame | None,
     if city != "(Alle)" and "city" in subset.columns:
         subset = subset[subset["city"] == city]
 
+    if districts and "district" in subset.columns:
+        subset = subset[subset["district"].isin(districts)]
+
     if chains and "chain" in subset.columns:
         subset = subset[subset["chain"].isin(chains)]
 
@@ -286,6 +865,9 @@ def apply_filters(df: pd.DataFrame | None,
 
     if roles and "broker_role" in subset.columns:
         subset = subset[subset["broker_role"].isin(roles)]
+
+    if segments and "property_type" in subset.columns:
+        subset = subset[subset["property_type"].isin(segments)]
 
     if sources and "source" in subset.columns:
         subset = subset[subset["source"].isin(sources)]
@@ -434,34 +1016,89 @@ snapshot_ts = pd.Timestamp.now(tz="Europe/Oslo").strftime("%Y-%m-%d %H:%M")
 
 #Filters
 with st.expander("Filtre", expanded=True):
-    c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.2, 1])
+    st.caption("Bruk filtrene for å se hvem som selger mest i det området og segmentet du er opptatt av.")
 
+    row1_col1, row1_col2 = st.columns([1.2, 1.2])
     cities = ["(Alle)"] + sorted(df["city"].dropna().unique().tolist())
-    sel_city = c1.selectbox("By", cities, index=0)
+    sel_city = row1_col1.selectbox("By", cities, index=0)
 
+    district_series = df.get("district")
+    if district_series is None:
+        district_series = pd.Series(dtype="object")
+    if sel_city != "(Alle)" and "district" in df.columns:
+        base_mask = df["city"].eq(sel_city)
+        district_series = df.loc[base_mask, "district"]
+    district_clean = district_series.dropna() if isinstance(district_series, pd.Series) else pd.Series(dtype="object")
+    district_options = sorted({d for d in district_clean if d and d != "(ukjent bydel)"})
+    sel_districts = row1_col2.multiselect("Bydel", district_options, default=[])
+
+    row2_col1, row2_col2 = st.columns([1.2, 1.2])
+    segment_options = sorted(df["property_type"].dropna().unique().tolist()) if "property_type" in df.columns else []
+    sel_segments = row2_col1.multiselect(
+        "Boligsegment",
+        segment_options,
+        default=segment_options,
+        help="Velg hvilke boligtyper som skal inngå i oversikten."
+    )
+
+    role_options = sorted(df["broker_role"].dropna().unique().tolist()) if "broker_role" in df.columns else []
+    default_roles = role_options if role_options else []
+    sel_roles = row2_col2.multiselect(
+        "Meglerrolle/tittel",
+        role_options,
+        default=default_roles,
+        help="Skiller f.eks. mellom meglere og fullmektiger."
+    ) if role_options else []
+
+    row3_col1, row3_col2, row3_col3 = st.columns([1.1, 1.1, 1.2])
     chains = sorted(df["chain"].dropna().unique().tolist())
-    sel_chains = c2.multiselect("Kjede/kontor", chains, default=[])
-    chain_keyword = c2.text_input("Kjedesøk (tekst)", "", placeholder="F.eks. Nordvik")
+    sel_chains = row3_col1.multiselect("Kjede/kontor", chains, default=[])
+    chain_keyword = row3_col2.text_input("Kjedesøk", "", placeholder="F.eks. Nordvik")
 
     sources = sorted(df["source"].dropna().unique().tolist())
-    sel_sources = c3.multiselect("Kilde", sources, default=sources)
+    sel_sources = row3_col3.multiselect("Datakilde", sources, default=sources)
 
-    search = c4.text_input("Søk megler/kontor", "", placeholder="Søk…")
-
-    c5, _ = st.columns([1.2, 3])
-    period = c5.selectbox(
-        "Tidsperiode (brukes i listene under)",
+    row4_col1, row4_col2, row4_col3 = st.columns([1.1, 1.1, 1.2])
+    period = row4_col1.selectbox(
+        "Tidsperiode",
         ["Alle", "Siste 30 dager", "Siste 12 mnd", "Dette året"],
         index=0
     )
 
-    c6, _ = st.columns([1.2, 3])
-    role_options = sorted(df["broker_role"].dropna().unique().tolist()) if "broker_role" in df.columns else []
-    default_roles = role_options if role_options else []
-    sel_roles = c6.multiselect("Meglerrolle", role_options, default=default_roles) if role_options else []
+    if {"broker", "listing_id"}.issubset(df.columns) and not df.empty:
+        broker_counts = df.groupby("broker")["listing_id"].count()
+        max_sales_available = int(broker_counts.max()) if not broker_counts.empty else 1
+    else:
+        max_sales_available = 1
+    slider_max = max(max_sales_available, 5)
+    min_sales = row4_col2.slider(
+        "Min. antall salg",
+        min_value=0,
+        max_value=slider_max,
+        value=0,
+        help="Skjuler meglere med færre salg enn valgt terskel."
+    )
 
-flt = apply_filters(df, sel_city, sel_chains, chain_keyword, sel_roles, sel_sources, search, period)
-baseline_flt = apply_filters(baseline_df, sel_city, sel_chains, chain_keyword, sel_roles, sel_sources, search, period)
+    sort_metric_label = row4_col3.selectbox(
+        "Sorter etter",
+        ("Samlet verdi", "Antall salg", "Snittpris"),
+        index=0,
+        help="Bestem hvilket nøkkeltall meglerlisten skal rangeres etter."
+    )
+
+    search = st.text_input("Søk megler eller kontor", "", placeholder="Søk…")
+
+sort_metric_map = {
+    "Samlet verdi": "total_value",
+    "Antall salg": "total_sales",
+    "Snittpris": "avg_price",
+}
+sort_metric = sort_metric_map.get(sort_metric_label, "total_value")
+
+flt = apply_filters(df, sel_city, sel_districts, sel_chains, chain_keyword, sel_roles, sel_segments, sel_sources, search, period)
+baseline_flt = apply_filters(baseline_df, sel_city, sel_districts, sel_chains, chain_keyword, sel_roles, sel_segments, sel_sources, search, period)
+flt = enforce_min_sales(flt, min_sales)
+baseline_flt = enforce_min_sales(baseline_flt, min_sales)
 baseline_has_data = not baseline_flt.empty
 
 #KPI row (last 12m vs previous 12m
@@ -668,6 +1305,37 @@ with colR:
         """, unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
+
+# -------------------- Phase 2 broker ranking --------------------
+st.markdown("<hr style='opacity:0.15;'>", unsafe_allow_html=True)
+st.markdown("<div class=\"mm-section-title\">Fase 2 – Megleroversikt</div>", unsafe_allow_html=True)
+
+phase2_ranking = build_broker_ranking(flt)
+if min_sales > 0 and not phase2_ranking.empty:
+    phase2_ranking = phase2_ranking[phase2_ranking["total_sales"] >= min_sales]
+
+if not phase2_ranking.empty:
+    phase2_sorted = phase2_ranking.sort_values(sort_metric, ascending=False).reset_index(drop=True)
+    phase2_sorted["rank"] = phase2_sorted.index + 1
+else:
+    phase2_sorted = phase2_ranking
+
+selected_key = st.session_state.get("phase2_selected")
+valid_keys = set(phase2_sorted["broker_key"].tolist()) if "broker_key" in phase2_sorted else set()
+if not valid_keys or selected_key not in valid_keys:
+    st.session_state["phase2_view_mode"] = "list"
+    st.session_state["phase2_selected"] = None
+    selected_key = None
+
+st.caption(f"Meglere i utvalget: {len(phase2_sorted)} (etter filtrering og terskler)")
+
+if phase2_sorted.empty:
+    st.info("Ingen meglere matcher filtrene. Juster bydel, segment eller min. antall salg.")
+else:
+    if st.session_state.get("phase2_view_mode") == "profile" and st.session_state.get("phase2_selected"):
+        render_phase2_profile(st.session_state["phase2_selected"], phase2_sorted, flt, baseline_flt)
+    else:
+        render_phase2_list(phase2_sorted)
 
 #summerer type
 type_summary = (

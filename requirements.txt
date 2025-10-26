@@ -2,3 +2,7 @@ requests
 pandas
 python-dateutil
 streamlit
+fastapi
+uvicorn
+numpy
+pydantic

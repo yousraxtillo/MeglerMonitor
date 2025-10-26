@@ -53,6 +53,49 @@ def load_snapshot_csv(filename: str, which: str = "earliest") -> tuple[pd.DataFr
     return df, stamp
 
 
+PROFILE_COLUMN_ALIASES = {
+    "megler": "broker",
+    "broker": "broker",
+    "navn": "broker",
+    "kontor": "chain",
+    "chain": "chain",
+    "kjede": "chain",
+    "linkedIn": "linkedin_url",
+    "linkedin": "linkedin_url",
+    "linkedin_url": "linkedin_url",
+    "experience": "experience_years",
+    "experience_years": "experience_years",
+    "years_experience": "experience_years",
+    "erfaring": "experience_years",
+    "age": "age",
+    "alder": "age",
+}
+
+
+@st.cache_data
+def load_broker_profiles() -> pd.DataFrame:
+    df = load_csv(OUT / "broker_profiles.csv")
+    if df.empty:
+        return df
+    rename_map = {}
+    for col in df.columns:
+        key = PROFILE_COLUMN_ALIASES.get(col.strip().lower())
+        if key:
+            rename_map[col] = key
+    cleaned = df.rename(columns=rename_map)
+    for core in ("broker", "chain"):
+        if core not in cleaned.columns:
+            cleaned[core] = ""
+        cleaned[core] = cleaned[core].fillna("").astype(str).str.strip()
+    if "linkedin_url" in cleaned.columns:
+        cleaned["linkedin_url"] = cleaned["linkedin_url"].fillna("").astype(str).str.strip()
+    if "experience_years" in cleaned.columns:
+        cleaned["experience_years"] = pd.to_numeric(cleaned["experience_years"], errors="coerce")
+    if "age" in cleaned.columns:
+        cleaned["age"] = pd.to_numeric(cleaned["age"], errors="coerce")
+    return cleaned
+
+
 def fmt_nok(x: float | int | None) -> str:
     if x is None or (isinstance(x, float) and (pd.isna(x) or math.isnan(float(x)))):
         return "–"
@@ -398,10 +441,21 @@ def render_phase2_list(ranking: pd.DataFrame) -> None:
                 st.session_state["phase2_selected"] = row["broker_key"]
                 st.rerun()
 
+    csv_export = ranking.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Last ned hele meglerlisten (CSV)",
+        data=csv_export,
+        file_name="meglermonitor_rangering.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    st.caption("Meglere merket «Høyvolum» ligger i toppsjiktet på samlet verdi for utvalget.")
+
     with st.expander("Se hele listen i tabellform"):
-        display_df = ranking[["rank", "broker", "chain", "primary_location", "dominant_segment", "total_sales", "total_value", "avg_price"]].copy()
+        display_df = ranking[["rank", "broker", "chain", "primary_location", "dominant_segment", "total_sales", "total_value", "avg_price", "high_volume"]].copy()
         display_df["total_value"] = display_df["total_value"].apply(fmt_compact_nok_with_kr)
         display_df["avg_price"] = display_df["avg_price"].apply(fmt_compact_nok_with_kr)
+        display_df["high_volume"] = display_df["high_volume"].map(lambda flag: "Ja" if flag else "–")
         display_df = display_df.rename(columns={
             "rank": "#",
             "broker": "Megler",
@@ -411,6 +465,7 @@ def render_phase2_list(ranking: pd.DataFrame) -> None:
             "total_sales": "Salg",
             "total_value": "Samlet verdi",
             "avg_price": "Snittpris",
+            "high_volume": "Høyvolum",
         })
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
@@ -429,7 +484,8 @@ def _growth_last_periods(df_in: pd.DataFrame, days: int = 90) -> tuple[int, int]
 def render_phase2_profile(selected_key: str,
                           ranking: pd.DataFrame,
                           df_filtered: pd.DataFrame,
-                          baseline_filtered: pd.DataFrame | None) -> None:
+                          baseline_filtered: pd.DataFrame | None,
+                          profiles_df: pd.DataFrame | None = None) -> None:
     if not selected_key:
         st.info("Ingen megler valgt.")
         return
@@ -456,6 +512,20 @@ def render_phase2_profile(selected_key: str,
     st.markdown(header_md, unsafe_allow_html=True)
     meta_line = f"{row.get('broker_role', '(ukjent rolle)')} · {row.get('city', '')} — {row.get('primary_location', '')}"
     st.caption(meta_line)
+    profile_info = None
+    if profiles_df is not None and not profiles_df.empty:
+        profile_matches = profiles_df[
+            (profiles_df["broker"].str.casefold() == broker_name.casefold())
+            & (profiles_df["chain"].str.casefold() == chain_name.casefold())
+        ]
+        if profile_matches.empty:
+            # allow fallback on broker name only
+            profile_matches = profiles_df[
+                profiles_df["broker"].str.casefold() == broker_name.casefold()
+            ]
+        if not profile_matches.empty:
+            profile_info = profile_matches.iloc[0].to_dict()
+
     if row.get("high_volume"):
         st.success("Denne megleren er i høyvolum-segmentet for gjeldende filtrering.")
 
@@ -620,7 +690,23 @@ def render_phase2_profile(selected_key: str,
                 )
 
     st.markdown("**Profilinformasjon**")
-    st.info("LinkedIn-integrasjon og erfaringsdata er ikke hentet ennå. Legg til `out/broker_profiles.csv` med kolonnene `broker`, `chain`, `linkedin_url`, `experience_years`, `age` for å berike kortet.")
+    if profile_info:
+        profile_lines: list[str] = []
+        linkedin_url = profile_info.get("linkedin_url")
+        if isinstance(linkedin_url, str) and linkedin_url:
+            profile_lines.append(f"- [LinkedIn-profil]({linkedin_url})")
+        experience_years = profile_info.get("experience_years")
+        if pd.notna(experience_years):
+            profile_lines.append(f"- Erfaring: {float(experience_years):.0f} år")
+        age = profile_info.get("age")
+        if pd.notna(age):
+            profile_lines.append(f"- Alder: {int(age)} år")
+        if not profile_lines:
+            st.info("Tilleggsdata funnet, men ingen felter med innhold.")
+        else:
+            st.markdown("\n".join(profile_lines))
+    else:
+        st.info("Legg til `out/broker_profiles.csv` med kolonnene `broker`, `chain`, `linkedin_url`, `experience_years`, `age` for å berike kortet.")
 
 
 STATUS_LABELS = {

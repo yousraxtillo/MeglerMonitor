@@ -304,6 +304,17 @@ function cloneFilters(value: FilterState): FilterState {
   };
 }
 
+function buildFilterSignature(filters: FilterState): string {
+  return JSON.stringify({
+    ...filters,
+    districts: [...filters.districts],
+    chains: [...filters.chains],
+    roles: [...filters.roles],
+    segments: [...filters.segments],
+    sources: [...filters.sources],
+  });
+}
+
 function buildQuery(params: FilterState): URLSearchParams {
   const query = new URLSearchParams();
   if (params.city) query.append("city", params.city);
@@ -339,7 +350,6 @@ export default function Home() {
   const [overview, setOverview] = useState<OverviewResponse | null>(null);
   const [overviewLoading, setOverviewLoading] = useState<boolean>(true);
   const [showOverview, setShowOverview] = useState<boolean>(true);
-  const [hasApplied, setHasApplied] = useState<boolean>(false);
   const [districtQuery, setDistrictQuery] = useState<string>("");
   const [segmentQuery, setSegmentQuery] = useState<string>("");
   const [roleQuery, setRoleQuery] = useState<string>("");
@@ -359,6 +369,15 @@ export default function Home() {
   const [showAllLocations, setShowAllLocations] = useState<boolean>(false);
   const [showAllPeers, setShowAllPeers] = useState<boolean>(false);
   const [showAllRecommendations, setShowAllRecommendations] = useState<boolean>(false);
+
+  const commitFilters = useCallback((next: FilterState) => {
+    const clone = cloneFilters(next);
+    setSelectedBrokerKey(null);
+    setBrokerDetail(null);
+    setDetailError(null);
+    setRanking(null);
+    setAppliedFilters(clone);
+  }, []);
 
   const rankedItems = useMemo(() => ranking?.items ?? [], [ranking]);
   const topCommissionBrokers = useMemo(
@@ -566,10 +585,28 @@ export default function Home() {
     fetchOverview().catch((err) => console.error(err));
   }, [loadFilters, fetchOverview]);
 
+  const pendingSignature = useMemo(
+    () => buildFilterSignature(pendingFilters),
+    [pendingFilters]
+  );
+  const appliedSignature = useMemo(
+    () => buildFilterSignature(appliedFilters),
+    [appliedFilters]
+  );
+
   useEffect(() => {
-    if (!hasApplied) return;
+    if (pendingSignature === appliedSignature) {
+      return undefined;
+    }
+    const timer = setTimeout(() => {
+      commitFilters(pendingFilters);
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [pendingSignature, appliedSignature, pendingFilters, commitFilters]);
+
+  useEffect(() => {
     fetchRanking(appliedFilters).catch((err) => console.error(err));
-  }, [appliedFilters, hasApplied, fetchRanking]);
+  }, [appliedFilters, fetchRanking]);
 
   useEffect(() => {
     if (!selectedBrokerKey) {
@@ -577,7 +614,6 @@ export default function Home() {
       setDetailError(null);
       return;
     }
-    if (!hasApplied) return;
     setDetailLoading(true);
     setDetailError(null);
     setBrokerDetail(null);
@@ -599,7 +635,7 @@ export default function Home() {
         setDetailError(err instanceof Error ? err.message : "Ukjent feil ved henting av meglerkort");
       })
       .finally(() => setDetailLoading(false));
-  }, [selectedBrokerKey, appliedFilters, hasApplied]);
+  }, [selectedBrokerKey, appliedFilters]);
 
   useEffect(() => {
     if (!brokerDetail) return;
@@ -610,13 +646,7 @@ export default function Home() {
   }, [brokerDetail]);
 
   const applyFilters = () => {
-    const next = cloneFilters(pendingFilters);
-    setHasApplied(true);
-    setSelectedBrokerKey(null);
-    setBrokerDetail(null);
-    setDetailError(null);
-    setRanking(null);
-    setAppliedFilters(next);
+    commitFilters(pendingFilters);
   };
 
   const closeBrokerDetail = () => {

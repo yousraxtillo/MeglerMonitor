@@ -230,7 +230,7 @@ def _extract_dnb_published(doc: dict, fallback: str) -> str:
 
     return primary or fallback
 
-#robust session #
+#robust session
 session = requests.Session()
 adapter = HTTPAdapter(max_retries=Retry(total=3, backoff_factor=0.6, status_forcelist=[429,500,502,503,504]))
 session.mount("https://", adapter); session.mount("http://", adapter)

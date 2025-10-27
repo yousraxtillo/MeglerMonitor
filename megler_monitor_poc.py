@@ -228,7 +228,7 @@ def _extract_dnb_published(doc: dict, fallback: str) -> str:
         media_dates[0] if media_dates else None,
     ])
 
-    return primary or fallback. #COME ONE
+    return primary or fallback
 
 #robust session
 session = requests.Session()

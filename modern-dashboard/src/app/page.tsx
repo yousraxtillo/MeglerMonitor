@@ -510,7 +510,7 @@ export default function Home() {
         sources: data.sources ?? [],
       });
     } catch (err) {
-      console.error(err);
+      console.error(err); /*1*/
       setError(
         err instanceof Error
           ? err.message
